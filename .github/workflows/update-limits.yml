@@ -1,0 +1,31 @@
+name: Update Fiat Limits
+
+on:
+  repository_dispatch:
+    types: [update-limits]
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install chromium --with-deps
+
+      - name: Run update script
+        env:
+          ADMIN_USER: ${{ secrets.ADMIN_USER }}
+          ADMIN_PASS: ${{ secrets.ADMIN_PASS }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CS_GROUP_ID: ${{ secrets.CS_GROUP_ID }}
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: node run-update.js
