@@ -1,6 +1,6 @@
 // ============================================================
 // VF Limit Bot - GitHub Actions Playwright Script
-// 功能：登入後台 → 修改限額 → 截圖 → 發送到客服群 → 回報完成
+// Login to admin → Update limits → Screenshot → Send to CS group
 // ============================================================
 
 const { chromium } = require('playwright');
@@ -15,12 +15,11 @@ const ADMIN_PASS = process.env.ADMIN_PASS;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CS_GROUP_ID = process.env.CS_GROUP_ID;
 
-// 從環境變數讀取 payload
 const payload = JSON.parse(process.env.PAYLOAD || '{}');
 const {
   uid, currency, deposit_min, deposit_max,
   gp_withdraw_min, gp_withdraw_max, withdraw_unavailable,
-  callbackUrl,
+  callbackUrl, replyToMsgId,
 } = payload;
 
 async function main() {
@@ -33,7 +32,7 @@ async function main() {
   const changes = [];
 
   try {
-    // ---- Step 1: 登入 ----
+    // ---- Step 1: Login ----
     console.log(`[${uid}] Navigating to admin panel...`);
     await page.goto(ADMIN_URL, { waitUntil: 'networkidle', timeout: 30000 });
 
@@ -51,19 +50,19 @@ async function main() {
       await page.waitForTimeout(2000);
     }
 
-    // ---- Step 2: 進入 fiat-settings ----
+    // ---- Step 2: Navigate to fiat-settings ----
     console.log(`[${uid}] Navigating to fiat settings...`);
     await page.goto(FIAT_URL, { waitUntil: 'networkidle', timeout: 30000 });
     await page.waitForTimeout(2000);
 
-    // ---- Step 3: 切到對應幣種分頁 ----
+    // ---- Step 3: Switch to currency tab ----
     console.log(`[${uid}] Switching to ${currency} tab...`);
     const tabBtn = await page.$(`button:has-text("${currency}")`);
-    if (!tabBtn) throw new Error(`找不到 ${currency} 分頁按鈕`);
+    if (!tabBtn) throw new Error(`Cannot find ${currency} tab button`);
     await tabBtn.click();
     await page.waitForTimeout(1500);
 
-    // ---- Step 4: 讀取所有輸入欄位 ----
+    // ---- Step 4: Read all input fields ----
     const inputData = await page.evaluate(() => {
       const inputs = Array.from(document.querySelectorAll('input[type="number"]'));
       return inputs.map((inp, idx) => {
@@ -94,17 +93,18 @@ async function main() {
 
     console.log(`[${uid}] Found ${inputData.length} input fields`);
 
-    // ---- Step 5: 確定要改哪些欄位 ----
+    // ---- Step 5: Determine which fields to update ----
     const updates = getFieldUpdates(currency, inputData);
     if (updates.length === 0) {
       console.log(`[${uid}] No changes needed`);
-      await sendScreenshot(page, `📸 ${currency} 無需變更，數值已正確`);
-      await reportCompletion({ uid, success: true, message: '數值已是最新，無需修改', changes: [] });
-      await browser.close();
+      // Scroll to show full page and take screenshot
+      await page.waitForTimeout(500);
+      const caption = `✅ ${currency} — No changes needed, values are already correct.\n⏱ ${new Date().toISOString().replace('T', ' ').slice(0, 19)}`;
+      await sendScreenshotWithCaption(page, caption);
       return;
     }
 
-    // ---- Step 6: 逐一修改並儲存 ----
+    // ---- Step 6: Update fields one by one ----
     for (const u of updates) {
       console.log(`[${uid}] Updating field ${u.idx}: ${u.oldVal} → ${u.newVal} (${u.field})`);
 
@@ -120,7 +120,7 @@ async function main() {
 
       await page.waitForTimeout(500);
 
-      // 點儲存按鈕
+      // Click save button next to field
       await page.evaluate((idx) => {
         const inputs = Array.from(document.querySelectorAll('input[type="number"]'));
         const inp = inputs[idx];
@@ -135,7 +135,7 @@ async function main() {
 
       await page.waitForTimeout(1500);
 
-      // 確認對話框
+      // Confirm dialog
       await page.evaluate(() => {
         const btns = Array.from(document.querySelectorAll('button')).filter(b => b.innerText.trim() === '储存');
         if (btns.length > 0) btns[btns.length - 1].click();
@@ -145,24 +145,41 @@ async function main() {
       changes.push({ field: u.field, oldVal: u.oldVal, newVal: u.newVal });
     }
 
-    // ---- Step 7: 截圖 + 回報 ----
-    console.log(`[${uid}] Taking screenshot...`);
+    // ---- Step 7: Screenshot + Report (one message, reply to original) ----
+    console.log(`[${uid}] Taking screenshot and sending report...`);
     await page.waitForTimeout(1000);
-    await sendScreenshot(page, `📸 ${currency} 限額更新完成`);
-    await reportCompletion({ uid, success: true, changes });
+
+    // Scroll to show the full currency section
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await page.waitForTimeout(500);
+
+    // Build caption with changes
+    let caption = `✅ ${currency} Limit Update Completed\n━━━━━━━━━━━━━━━━━━\n\n`;
+    for (const c of changes) {
+      caption += `${c.field}: ${c.oldVal} → ${c.newVal} ✅\n`;
+    }
+    caption += `\n⏱ ${new Date().toISOString().replace('T', ' ').slice(0, 19)}`;
+
+    await sendScreenshotWithCaption(page, caption);
+
     console.log(`[${uid}] Done!`);
 
   } catch (err) {
     console.error(`[${uid}] Error:`, err);
-    try { await sendScreenshot(page, `❌ ${currency} 更新失敗截圖`); } catch (e) { /* ignore */ }
-    await reportCompletion({ uid, success: false, message: err.message });
+    try {
+      const caption = `❌ ${currency} Update Failed\n\nError: ${err.message}`;
+      await sendScreenshotWithCaption(page, caption);
+    } catch (e) {
+      // If screenshot also fails, report via callback
+      await reportCompletion({ uid, success: false, message: err.message, replyToMsgId });
+    }
     process.exit(1);
   } finally {
     await browser.close();
   }
 }
 
-// ---- 確定要改哪些欄位 ----
+// ---- Determine which fields to update ----
 function getFieldUpdates(cur, inputData) {
   const updates = [];
   const target = { deposit_min, deposit_max, gp_withdraw_min, gp_withdraw_max, withdraw_unavailable };
@@ -173,11 +190,11 @@ function getFieldUpdates(cur, inputData) {
     const minGP = inputData.find(i => i.section.includes('GP') && i.section.includes('INR') && i.label.includes('最低') && i.label.includes('GP'));
     const maxGP = inputData.find(i => i.section.includes('GP') && i.section.includes('INR') && i.label.includes('最高') && i.label.includes('GP'));
 
-    if (minDep && Number(minDep.value) !== target.deposit_min) updates.push({ idx: minDep.idx, field: 'INR→GP 单笔最低金额', oldVal: minDep.value, newVal: target.deposit_min });
-    if (maxDep && Number(maxDep.value) !== target.deposit_max) updates.push({ idx: maxDep.idx, field: 'INR→GP 单笔最高金额', oldVal: maxDep.value, newVal: target.deposit_max });
+    if (minDep && Number(minDep.value) !== target.deposit_min) updates.push({ idx: minDep.idx, field: 'INR→GP Min Deposit', oldVal: minDep.value, newVal: target.deposit_min });
+    if (maxDep && Number(maxDep.value) !== target.deposit_max) updates.push({ idx: maxDep.idx, field: 'INR→GP Max Deposit', oldVal: maxDep.value, newVal: target.deposit_max });
     if (!target.withdraw_unavailable && target.gp_withdraw_min !== null) {
-      if (minGP && Number(minGP.value) !== target.gp_withdraw_min) updates.push({ idx: minGP.idx, field: 'GP→INR 单笔最低GP', oldVal: minGP.value, newVal: target.gp_withdraw_min });
-      if (maxGP && Number(maxGP.value) !== target.gp_withdraw_max) updates.push({ idx: maxGP.idx, field: 'GP→INR 单笔最高GP', oldVal: maxGP.value, newVal: target.gp_withdraw_max });
+      if (minGP && Number(minGP.value) !== target.gp_withdraw_min) updates.push({ idx: minGP.idx, field: 'GP→INR Min GP', oldVal: minGP.value, newVal: target.gp_withdraw_min });
+      if (maxGP && Number(maxGP.value) !== target.gp_withdraw_max) updates.push({ idx: maxGP.idx, field: 'GP→INR Max GP', oldVal: maxGP.value, newVal: target.gp_withdraw_max });
     }
   }
 
@@ -187,11 +204,11 @@ function getFieldUpdates(cur, inputData) {
     const minGP = inputData.find(i => i.section.includes('GP') && i.label.includes('最低') && i.label.includes('GP'));
     const maxGP = inputData.find(i => i.section.includes('GP') && i.label.includes('最高') && i.label.includes('GP'));
 
-    if (minDep && Number(minDep.value) !== target.deposit_min) updates.push({ idx: minDep.idx, field: 'PKR 单笔最低储值', oldVal: minDep.value, newVal: target.deposit_min });
-    if (maxDep && Number(maxDep.value) !== target.deposit_max) updates.push({ idx: maxDep.idx, field: 'PKR 单笔最高储值', oldVal: maxDep.value, newVal: target.deposit_max });
+    if (minDep && Number(minDep.value) !== target.deposit_min) updates.push({ idx: minDep.idx, field: 'PKR Min Deposit', oldVal: minDep.value, newVal: target.deposit_min });
+    if (maxDep && Number(maxDep.value) !== target.deposit_max) updates.push({ idx: maxDep.idx, field: 'PKR Max Deposit', oldVal: maxDep.value, newVal: target.deposit_max });
     if (!target.withdraw_unavailable && target.gp_withdraw_min !== null) {
-      if (minGP && Number(minGP.value) !== target.gp_withdraw_min) updates.push({ idx: minGP.idx, field: 'GP→PKR 单笔最低GP', oldVal: minGP.value, newVal: target.gp_withdraw_min });
-      if (maxGP && Number(maxGP.value) !== target.gp_withdraw_max) updates.push({ idx: maxGP.idx, field: 'GP→PKR 单笔最高GP', oldVal: maxGP.value, newVal: target.gp_withdraw_max });
+      if (minGP && Number(minGP.value) !== target.gp_withdraw_min) updates.push({ idx: minGP.idx, field: 'GP→PKR Min GP', oldVal: minGP.value, newVal: target.gp_withdraw_min });
+      if (maxGP && Number(maxGP.value) !== target.gp_withdraw_max) updates.push({ idx: maxGP.idx, field: 'GP→PKR Max GP', oldVal: maxGP.value, newVal: target.gp_withdraw_max });
     }
   }
 
@@ -201,28 +218,32 @@ function getFieldUpdates(cur, inputData) {
     const minGP = inputData.find(i => i.label.includes('最低') && i.label.includes('GP'));
     const maxGP = inputData.find(i => i.label.includes('最高') && i.label.includes('GP'));
 
-    if (minDep && Number(minDep.value) !== target.deposit_min) updates.push({ idx: minDep.idx, field: 'CNY 单笔最低储值', oldVal: minDep.value, newVal: target.deposit_min });
-    if (maxDep && Number(maxDep.value) !== target.deposit_max) updates.push({ idx: maxDep.idx, field: 'CNY 单笔最高储值', oldVal: maxDep.value, newVal: target.deposit_max });
+    if (minDep && Number(minDep.value) !== target.deposit_min) updates.push({ idx: minDep.idx, field: 'CNY Min Deposit', oldVal: minDep.value, newVal: target.deposit_min });
+    if (maxDep && Number(maxDep.value) !== target.deposit_max) updates.push({ idx: maxDep.idx, field: 'CNY Max Deposit', oldVal: maxDep.value, newVal: target.deposit_max });
     if (!target.withdraw_unavailable && target.gp_withdraw_min !== null) {
-      if (minGP && Number(minGP.value) !== target.gp_withdraw_min) updates.push({ idx: minGP.idx, field: 'CNY↔GP 单笔最低提领GP', oldVal: minGP.value, newVal: target.gp_withdraw_min });
-      if (maxGP && Number(maxGP.value) !== target.gp_withdraw_max) updates.push({ idx: maxGP.idx, field: 'CNY↔GP 单笔最高提领GP', oldVal: maxGP.value, newVal: target.gp_withdraw_max });
+      if (minGP && Number(minGP.value) !== target.gp_withdraw_min) updates.push({ idx: minGP.idx, field: 'CNY↔GP Min Withdraw GP', oldVal: minGP.value, newVal: target.gp_withdraw_min });
+      if (maxGP && Number(maxGP.value) !== target.gp_withdraw_max) updates.push({ idx: maxGP.idx, field: 'CNY↔GP Max Withdraw GP', oldVal: maxGP.value, newVal: target.gp_withdraw_max });
     }
   }
 
   return updates;
 }
 
-// ---- 發送截圖到客服群 ----
-async function sendScreenshot(page, caption) {
-  const buf = await page.screenshot({ fullPage: false });
+// ---- Send screenshot + caption as ONE message, reply to original ----
+async function sendScreenshotWithCaption(page, caption) {
+  // Take full page screenshot to capture both deposit and withdraw sections
+  const buf = await page.screenshot({ fullPage: true });
   const form = new FormData();
   form.append('chat_id', CS_GROUP_ID);
   form.append('caption', caption);
   form.append('photo', buf, { filename: 'screenshot.png', contentType: 'image/png' });
+  if (replyToMsgId) {
+    form.append('reply_to_message_id', String(replyToMsgId));
+  }
   await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, { method: 'POST', body: form });
 }
 
-// ---- 回報完成 ----
+// ---- Report completion (fallback for errors) ----
 async function reportCompletion(data) {
   if (!callbackUrl) return;
   await fetch(callbackUrl, {
