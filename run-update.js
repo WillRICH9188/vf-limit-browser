@@ -17,11 +17,19 @@ const CS_GROUP_ID = process.env.CS_GROUP_ID;
 
 const payload = JSON.parse(process.env.PAYLOAD || '{}');
 const {
-  uid, currency, deposit_min, deposit_max,
-  withdraw_min, withdraw_max,
-  gp_withdraw_min, gp_withdraw_max, withdraw_unavailable,
+  uid, currency,
+  deposit = {}, withdraw = {}, gp_withdraw = {},
   callbackUrl, replyToMsgId,
 } = payload;
+
+// 展開成原本的變數名（向後相容）
+const deposit_min = deposit.min;
+const deposit_max = deposit.max;
+const withdraw_min = withdraw.min;
+const withdraw_max = withdraw.max;
+const withdraw_unavailable = withdraw.unavailable || false;
+const gp_withdraw_min = gp_withdraw.min;
+const gp_withdraw_max = gp_withdraw.max;
 
 async function main() {
   console.log(`[${uid}] Starting update for ${currency}...`);
