@@ -18,6 +18,7 @@ const CS_GROUP_ID = process.env.CS_GROUP_ID;
 const payload = JSON.parse(process.env.PAYLOAD || '{}');
 const {
   uid, currency, deposit_min, deposit_max,
+  withdraw_min, withdraw_max,
   gp_withdraw_min, gp_withdraw_max, withdraw_unavailable,
   callbackUrl, replyToMsgId,
 } = payload;
