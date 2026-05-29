@@ -197,7 +197,7 @@ function buildCaption(cur, changes, inputData) {
 
   // Separate deposit and withdraw changes
   const depChanges = changes.filter(c => c.field.includes('Deposit'));
-  const wdChanges = changes.filter(c => c.field.includes('GP'));
+  const wdChanges = changes.filter(c => !c.field.includes('Deposit'));
 
   // Get current values from inputData for "no change" fields
   const allFields = getAllFieldValues(cur, inputData);
