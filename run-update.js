@@ -109,7 +109,7 @@ async function main() {
       const sections = getSectionSelectors(currency);
       const depositShot = await scrollAndScreenshot(page, sections.deposit, `${currency} Deposit`);
       const withdrawShot = await scrollAndScreenshot(page, sections.withdraw, `${currency} Withdraw`);
-      const caption = `✅ ${currency} — No changes needed, values are already correct.\n⏱ ${new Date().toISOString().replace('T', ' ').slice(0, 19)}`;
+      const caption = `✅ ${currency} — No changes needed, values are already correct.\n⏱ ${taipeiNow()}`;
       await sendMediaGroup(depositShot, withdrawShot, caption);
       return;
     }
@@ -224,8 +224,13 @@ function buildCaption(cur, changes, inputData) {
     t += `   Max GP: ${gpMax ? gpMax.oldVal + ' → ' + gpMax.newVal + ' ✅' : allFields.gpMax + ' (no change)'}\n\n`;
   }
 
-  t += `⏱ ${new Date().toISOString().replace('T', ' ').slice(0, 19)}`;
+  t += `⏱ ${taipeiNow()}`;
   return t;
+}
+
+// ---- Format current time in Taipei timezone (GMT+8) ----
+function taipeiNow() {
+  return new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Taipei' });
 }
 
 // ---- Get all current field values for display ----
