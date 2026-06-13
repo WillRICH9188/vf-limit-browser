@@ -43,7 +43,8 @@ async function main() {
   try {
     // ---- Step 1: Login ----
     console.log(`[${uid}] Navigating to admin panel...`);
-    await page.goto(ADMIN_URL, { waitUntil: 'networkidle', timeout: 30000 });
+    await page.goto(ADMIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForTimeout(3000); // 等 React app 載入
 
     const loginForm = await page.$('input[type="password"]');
     if (loginForm) {
@@ -55,14 +56,14 @@ async function main() {
 
       const loginBtn = await page.$('button[type="submit"], button:has-text("登入"), button:has-text("Login"), button:has-text("登录")');
       if (loginBtn) await loginBtn.click();
-      await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 15000 }).catch(() => {});
+      await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
       await page.waitForTimeout(2000);
     }
 
     // ---- Step 2: Navigate to fiat-settings ----
     console.log(`[${uid}] Navigating to fiat settings...`);
-    await page.goto(FIAT_URL, { waitUntil: 'networkidle', timeout: 30000 });
-    await page.waitForTimeout(2000);
+    await page.goto(FIAT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForTimeout(3000); // 等 React app 載入
 
     // ---- Step 3: Switch to currency tab ----
     console.log(`[${uid}] Switching to ${currency} tab...`);
