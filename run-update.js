@@ -344,27 +344,70 @@ function taipeiNow() {
   return new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Taipei' });
 }
 
-// ---- Scroll to a card by its title and take screenshot ----
+// ---- Take an element-bounded screenshot of the specified card ----
+// Finds the smallest container that holds the card title AND its 额度限制 block,
+// scrolls it into view, then captures using its bounding box.
 async function scrollAndScreenshot(page, cardTitle, label) {
-  if (cardTitle) {
-    await page.evaluate((title) => {
-      const all = Array.from(document.querySelectorAll('*'));
-      const target = all.find(el => {
-        const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
-        return own === title;
-      });
-      if (target) {
-        let scrollTarget = target;
-        for (let i = 0; i < 3; i++) {
-          if (scrollTarget.parentElement) scrollTarget = scrollTarget.parentElement;
+  console.log(`[${uid}] Screenshot: ${label} (card="${cardTitle}")`);
+  if (!cardTitle) return await page.screenshot({ fullPage: false });
+
+  // 1) Mark the target card with a data attribute so we can locate it from Playwright
+  const marked = await page.evaluate((title) => {
+    // Clear any prior mark
+    document.querySelectorAll('[data-vf-shot]').forEach(el => el.removeAttribute('data-vf-shot'));
+
+    const all = Array.from(document.querySelectorAll('*'));
+    const headings = all.filter(el => {
+      const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
+      return own === title;
+    });
+
+    for (const heading of headings) {
+      let card = heading.parentElement;
+      for (let i = 0; i < 10; i++) {
+        if (!card) break;
+        // The actual card container holds both the title AND the 额度限制 block.
+        // We pick the smallest such container.
+        if (card.innerText.includes(title)
+            && card.innerText.includes('额度限制')
+            && card.innerText.includes('单笔交易的下限与上限')) {
+          card.setAttribute('data-vf-shot', '1');
+          // Scroll it into view so the screenshot reliably captures it
+          card.scrollIntoView({ behavior: 'instant', block: 'start' });
+          return true;
         }
-        scrollTarget.scrollIntoView({ behavior: 'instant', block: 'start' });
+        card = card.parentElement;
       }
-    }, cardTitle);
-    await page.waitForTimeout(800);
+    }
+    return false;
+  }, cardTitle);
+
+  if (!marked) {
+    console.log(`[${uid}] Could not locate card "${cardTitle}", falling back to viewport screenshot`);
+    return await page.screenshot({ fullPage: false });
   }
-  console.log(`[${uid}] Screenshot: ${label}`);
-  return await page.screenshot({ fullPage: false });
+
+  await page.waitForTimeout(600);
+  const handle = await page.$('[data-vf-shot="1"]');
+  if (!handle) {
+    return await page.screenshot({ fullPage: false });
+  }
+
+  // 2) Capture only the card's bounding box
+  let shot;
+  try {
+    shot = await handle.screenshot();
+  } catch (e) {
+    console.log(`[${uid}] Element screenshot failed (${e.message}), falling back to viewport`);
+    shot = await page.screenshot({ fullPage: false });
+  }
+
+  // 3) Clean up marker
+  await page.evaluate(() => {
+    document.querySelectorAll('[data-vf-shot]').forEach(el => el.removeAttribute('data-vf-shot'));
+  });
+
+  return shot;
 }
 
 // ---- Send two screenshots as album (one message), reply to original ----
