@@ -1,6 +1,16 @@
 // ============================================================
 // VF Limit Bot - GitHub Actions Playwright Script
 // Login to admin → Update limits → Screenshot → Send to CS group
+//
+// Updated for new admin layout (2026-06):
+//  - Sections collapsed by default — click "全部展开" to expand
+//  - Each field saved INDIVIDUALLY via small "储存" button that appears
+//    only AFTER the value is changed (top-right of the 额度限制 row).
+//  - After clicking that 储存, a confirmation dialog appears with
+//    "取消" / "储存" — must click the dialog's 储存 to actually save.
+//  - DO NOT click "套用" — it resets the field to system defaults.
+//  - If both min and max need to change: do MAX first (save+confirm),
+//    then MIN (save+confirm). One field per save cycle.
 // ============================================================
 
 const { chromium } = require('playwright');
@@ -22,7 +32,6 @@ const {
   callbackUrl, replyToMsgId,
 } = payload;
 
-// 展開成原本的變數名（向後相容）
 const deposit_min = deposit.min;
 const deposit_max = deposit.max;
 const withdraw_min = withdraw.min;
@@ -30,6 +39,13 @@ const withdraw_max = withdraw.max;
 const withdraw_unavailable = withdraw.unavailable || false;
 const gp_withdraw_min = gp_withdraw.min;
 const gp_withdraw_max = gp_withdraw.max;
+
+// Card titles that contain the 额度限制 sub-block per currency
+const CARD_MAP = {
+  INR: { deposit: 'INR → GP', withdraw: 'GP → INR' },
+  PKR: { deposit: '储值设定', withdraw: 'GP → PKR' },
+  CNY: { deposit: '储值设定', withdraw: 'CNY ↔ GP' },
+};
 
 async function main() {
   console.log(`[${uid}] Starting update for ${currency}...`);
@@ -44,7 +60,7 @@ async function main() {
     // ---- Step 1: Login ----
     console.log(`[${uid}] Navigating to admin panel...`);
     await page.goto(ADMIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForTimeout(3000); // 等 React app 載入
+    await page.waitForTimeout(3000);
 
     const loginForm = await page.$('input[type="password"]');
     if (loginForm) {
@@ -63,118 +79,130 @@ async function main() {
     // ---- Step 2: Navigate to fiat-settings ----
     console.log(`[${uid}] Navigating to fiat settings...`);
     await page.goto(FIAT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForTimeout(3000); // 等 React app 載入
+    await page.waitForTimeout(3000);
 
-    // ---- Step 3: Switch to currency tab ----
+    // ---- Step 3: Click currency tab ----
     console.log(`[${uid}] Switching to ${currency} tab...`);
-    const tabBtn = await page.$(`button:has-text("${currency}")`);
-    if (!tabBtn) throw new Error(`Cannot find ${currency} tab button`);
-    await tabBtn.click();
-    await page.waitForTimeout(1500);
+    const tabClicked = await page.evaluate((cur) => {
+      const spans = Array.from(document.querySelectorAll('span'));
+      const targetSpan = spans.find(s => s.innerText.trim() === cur);
+      const btn = targetSpan?.closest('button');
+      if (btn) { btn.click(); return true; }
+      return false;
+    }, currency);
+    if (!tabClicked) throw new Error(`Cannot find ${currency} tab button`);
+    await page.waitForTimeout(2000);
 
-    // ---- Step 4: Read all input fields ----
-    const inputData = await page.evaluate(() => {
-      const inputs = Array.from(document.querySelectorAll('input[type="number"]'));
-      return inputs.map((inp, idx) => {
-        let label = '';
-        let p = inp.parentElement;
-        while (p && !label) {
-          const labs = p.querySelectorAll('label');
-          if (labs.length === 1) label = labs[0].innerText.trim();
-          if (label) break;
-          p = p.parentElement;
-          if (p === document.body) break;
-        }
-        let section = '';
-        let curr = inp;
-        for (let j = 0; j < 20; j++) {
-          curr = curr.parentElement;
-          if (!curr) break;
-          const heads = curr.querySelectorAll(':scope > h3, :scope > h2, :scope > div > h3');
-          for (const h of heads) {
-            const t = h.innerText.trim();
-            if (t.length < 50) { section = t; break; }
-          }
-          if (section) break;
-        }
-        return { idx, value: inp.value, label, section };
-      });
+    // ---- Step 4: Expand all sections ----
+    console.log(`[${uid}] Expanding all sections...`);
+    await page.evaluate(() => {
+      const btn = Array.from(document.querySelectorAll('button')).find(b => b.innerText.trim() === '全部展开');
+      if (btn) btn.click();
     });
+    await page.waitForTimeout(2500);
 
-    console.log(`[${uid}] Found ${inputData.length} input fields`);
+    // ---- Step 5: Read current values ----
+    const cards = CARD_MAP[currency];
+    if (!cards) throw new Error(`No card mapping for currency ${currency}`);
 
-    // ---- Step 5: Determine which fields to update ----
-    const updates = getFieldUpdates(currency, inputData);
-    if (updates.length === 0) {
+    const currentValues = await page.evaluate((cards) => {
+      function findLimitInputs(cardTitle) {
+        const all = Array.from(document.querySelectorAll('*'));
+        const headings = all.filter(el => {
+          const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
+          return own === cardTitle;
+        });
+        for (const heading of headings) {
+          let card = heading.parentElement;
+          for (let i = 0; i < 8; i++) {
+            if (!card) break;
+            if (card.innerText.includes('额度限制') && card.innerText.includes('单笔交易的下限与上限')) {
+              const subHeadings = Array.from(card.querySelectorAll('*')).filter(el => {
+                const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
+                return own === '额度限制';
+              });
+              for (const sh of subHeadings) {
+                let block = sh.parentElement;
+                for (let j = 0; j < 8; j++) {
+                  if (!block) break;
+                  const inps = block.querySelectorAll('input[type="number"]');
+                  if (inps.length >= 2) {
+                    return { minVal: inps[0].value, maxVal: inps[1].value };
+                  }
+                  block = block.parentElement;
+                }
+              }
+            }
+            card = card.parentElement;
+          }
+        }
+        return null;
+      }
+      return {
+        deposit: findLimitInputs(cards.deposit),
+        withdraw: findLimitInputs(cards.withdraw),
+      };
+    }, cards);
+
+    console.log(`[${uid}] Current values: ${JSON.stringify(currentValues)}`);
+    if (!currentValues.deposit) throw new Error(`Cannot find deposit card "${cards.deposit}"`);
+    if (!currentValues.withdraw && !withdraw_unavailable) throw new Error(`Cannot find withdraw card "${cards.withdraw}"`);
+
+    // ---- Step 6: Build list of individual field updates ----
+    // Each update is ONE field (min or max). User instruction:
+    //   "如果同時修改最高值跟最低值 先把最高值設定然後按一次儲存 再設置最低值按一次儲存"
+    // So we save MAX first, then MIN, for each card.
+    const fieldUpdates = [];
+    const depMinOld = Number(currentValues.deposit.minVal);
+    const depMaxOld = Number(currentValues.deposit.maxVal);
+
+    if (depMaxOld !== deposit_max) {
+      fieldUpdates.push({ cardTitle: cards.deposit, fieldIdx: 1, kind: 'depositMax', oldVal: currentValues.deposit.maxVal, newVal: deposit_max });
+    }
+    if (depMinOld !== deposit_min) {
+      fieldUpdates.push({ cardTitle: cards.deposit, fieldIdx: 0, kind: 'depositMin', oldVal: currentValues.deposit.minVal, newVal: deposit_min });
+    }
+
+    if (!withdraw_unavailable && currentValues.withdraw) {
+      const wdMinOld = Number(currentValues.withdraw.minVal);
+      const wdMaxOld = Number(currentValues.withdraw.maxVal);
+      if (wdMaxOld !== gp_withdraw_max) {
+        fieldUpdates.push({ cardTitle: cards.withdraw, fieldIdx: 1, kind: 'withdrawMax', oldVal: currentValues.withdraw.maxVal, newVal: gp_withdraw_max });
+      }
+      if (wdMinOld !== gp_withdraw_min) {
+        fieldUpdates.push({ cardTitle: cards.withdraw, fieldIdx: 0, kind: 'withdrawMin', oldVal: currentValues.withdraw.minVal, newVal: gp_withdraw_min });
+      }
+    }
+
+    if (fieldUpdates.length === 0) {
       console.log(`[${uid}] No changes needed`);
-      const sections = getSectionSelectors(currency);
-      const depositShot = await scrollAndScreenshot(page, sections.deposit, `${currency} Deposit`);
-      const withdrawShot = await scrollAndScreenshot(page, sections.withdraw, `${currency} Withdraw`);
+      const depositShot = await scrollAndScreenshot(page, cards.deposit, `${currency} Deposit`);
+      const withdrawShot = await scrollAndScreenshot(page, cards.withdraw, `${currency} Withdraw`);
       const caption = `✅ ${currency} — No changes needed, values are already correct.\n⏱ ${taipeiNow()}`;
       await sendMediaGroup(depositShot, withdrawShot, caption);
       return;
     }
 
-    // ---- Step 6: Update fields one by one ----
-    for (const u of updates) {
-      console.log(`[${uid}] Updating field ${u.idx}: ${u.oldVal} → ${u.newVal} (${u.field})`);
-
-      await page.evaluate(({ idx, val }) => {
-        const inputs = Array.from(document.querySelectorAll('input[type="number"]'));
-        const inp = inputs[idx];
-        const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-        nativeSetter.call(inp, val);
-        inp.dispatchEvent(new Event('input', { bubbles: true }));
-        inp.dispatchEvent(new Event('change', { bubbles: true }));
-        inp.dispatchEvent(new Event('blur', { bubbles: true }));
-      }, { idx: u.idx, val: String(u.newVal) });
-
-      await page.waitForTimeout(500);
-
-      // Click save button next to field
-      await page.evaluate((idx) => {
-        const inputs = Array.from(document.querySelectorAll('input[type="number"]'));
-        const inp = inputs[idx];
-        let p = inp.parentElement;
-        for (let i = 0; i < 5; i++) {
-          if (!p) break;
-          const btn = Array.from(p.querySelectorAll('button')).find(b => b.innerText.trim() === '储存');
-          if (btn) { btn.click(); return; }
-          p = p.parentElement;
-        }
-      }, u.idx);
-
-      await page.waitForTimeout(1500);
-
-      // Confirm dialog
-      await page.evaluate(() => {
-        const btns = Array.from(document.querySelectorAll('button')).filter(b => b.innerText.trim() === '储存');
-        if (btns.length > 0) btns[btns.length - 1].click();
+    // ---- Step 7: Apply each field update one at a time ----
+    for (const u of fieldUpdates) {
+      console.log(`[${uid}] Updating ${u.kind} (${u.cardTitle}): ${u.oldVal} → ${u.newVal}`);
+      const ok = await applyFieldUpdate(page, u.cardTitle, u.fieldIdx, u.newVal);
+      if (!ok) throw new Error(`Failed to save ${u.kind} in card "${u.cardTitle}"`);
+      changes.push({
+        field: `${currency} ${labelOf(u.kind)}`,
+        oldVal: u.oldVal,
+        newVal: u.newVal,
       });
-
-      await page.waitForTimeout(2000);
-      changes.push({ field: u.field, oldVal: u.oldVal, newVal: u.newVal });
+      await page.waitForTimeout(1000); // breathe between fields
     }
 
-    // ---- Step 7: Take deposit + withdraw screenshots, send as album ----
+    // ---- Step 8: Screenshots + report ----
     console.log(`[${uid}] Taking screenshots...`);
     await page.waitForTimeout(1000);
-
-    // Define which sections to screenshot per currency
-    const sections = getSectionSelectors(currency);
-
-    // Screenshot 1: Deposit section
-    const depositShot = await scrollAndScreenshot(page, sections.deposit, `${currency} Deposit`);
-
-    // Screenshot 2: Withdraw section
-    const withdrawShot = await scrollAndScreenshot(page, sections.withdraw, `${currency} Withdraw`);
-
-    // Build caption with structured format
-    const caption = buildCaption(currency, changes, inputData);
-
-    // Send both screenshots as album in one message, reply to original
+    const depositShot = await scrollAndScreenshot(page, cards.deposit, `${currency} Deposit`);
+    const withdrawShot = await scrollAndScreenshot(page, cards.withdraw, `${currency} Withdraw`);
+    const caption = buildCaption(currency, changes, currentValues);
     await sendMediaGroup(depositShot, withdrawShot, caption);
-
     console.log(`[${uid}] Done!`);
 
   } catch (err) {
@@ -191,38 +219,120 @@ async function main() {
   }
 }
 
+// ---- Apply a single field update (change value + click 储存 + confirm dialog) ----
+async function applyFieldUpdate(page, cardTitle, fieldIdx, newVal) {
+  // Step 1: change the value in browser context
+  const changed = await page.evaluate(({ cardTitle, fieldIdx, newVal }) => {
+    const all = Array.from(document.querySelectorAll('*'));
+    const headings = all.filter(el => {
+      const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
+      return own === cardTitle;
+    });
+    for (const heading of headings) {
+      let card = heading.parentElement;
+      for (let i = 0; i < 8; i++) {
+        if (!card) break;
+        if (card.innerText.includes('额度限制') && card.innerText.includes('单笔交易的下限与上限')) {
+          const subHeadings = Array.from(card.querySelectorAll('*')).filter(el => {
+            const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
+            return own === '额度限制';
+          });
+          for (const sh of subHeadings) {
+            let block = sh.parentElement;
+            for (let j = 0; j < 8; j++) {
+              if (!block) break;
+              const inps = block.querySelectorAll('input[type="number"]');
+              if (inps.length >= 2) {
+                const target = inps[fieldIdx];
+                const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                nativeSetter.call(target, String(newVal));
+                target.dispatchEvent(new Event('input', { bubbles: true }));
+                target.dispatchEvent(new Event('change', { bubbles: true }));
+                target.dispatchEvent(new Event('blur', { bubbles: true }));
+                // Mark this block so we can find it again to click 储存
+                block.setAttribute('data-vf-active', '1');
+                return true;
+              }
+              block = block.parentElement;
+            }
+          }
+        }
+        card = card.parentElement;
+      }
+    }
+    return false;
+  }, { cardTitle, fieldIdx, newVal });
+
+  if (!changed) return false;
+  await page.waitForTimeout(800); // wait for 储存 button to appear
+
+  // Step 2: click the 储存 button inside the active limit block
+  const saveClicked = await page.evaluate(() => {
+    const block = document.querySelector('[data-vf-active="1"]');
+    if (!block) return false;
+    // The small 储存 has text-[11px] class. Find it specifically (NOT 套用).
+    const saveBtn = Array.from(block.querySelectorAll('button')).find(b => {
+      return b.innerText.trim() === '储存';
+    });
+    if (!saveBtn) return false;
+    saveBtn.click();
+    block.removeAttribute('data-vf-active');
+    return true;
+  });
+
+  if (!saveClicked) return false;
+  await page.waitForTimeout(1200); // wait for confirmation dialog
+
+  // Step 3: click 储存 in confirmation dialog
+  const confirmed = await page.evaluate(() => {
+    // Find a dialog by looking for the 取消 button and its sibling 储存
+    const cancelBtn = Array.from(document.querySelectorAll('button')).find(b => b.innerText.trim() === '取消');
+    if (!cancelBtn) return false;
+    // The confirm 储存 is the sibling of 取消 inside the dialog
+    const dialogContainer = cancelBtn.closest('div[class*="rounded"]') || cancelBtn.parentElement;
+    const dialogSaveBtn = Array.from(dialogContainer.querySelectorAll('button')).find(b => b.innerText.trim() === '储存');
+    if (!dialogSaveBtn) return false;
+    dialogSaveBtn.click();
+    return true;
+  });
+
+  if (!confirmed) return false;
+  await page.waitForTimeout(2000); // wait for save complete + dialog close
+  return true;
+}
+
+// ---- Friendly labels for fields ----
+function labelOf(kind) {
+  switch (kind) {
+    case 'depositMin': return 'Deposit Min';
+    case 'depositMax': return 'Deposit Max';
+    case 'withdrawMin': return 'Withdraw GP Min';
+    case 'withdrawMax': return 'Withdraw GP Max';
+    default: return kind;
+  }
+}
+
 // ---- Build structured caption ----
-function buildCaption(cur, changes, inputData) {
-  const RATES = { INR: 1, PKR: 2.9, CNY: 0.07 };
-  const rate = RATES[cur];
-
-  // Separate deposit and withdraw changes
-  const depChanges = changes.filter(c => c.field.includes('Deposit'));
-  const wdChanges = changes.filter(c => !c.field.includes('Deposit'));
-
-  // Get current values from inputData for "no change" fields
-  const allFields = getAllFieldValues(cur, inputData);
+function buildCaption(cur, changes, currentValues) {
+  const depMin = changes.find(c => c.field.includes('Deposit Min'));
+  const depMax = changes.find(c => c.field.includes('Deposit Max'));
+  const wdMin = changes.find(c => c.field.includes('Withdraw GP Min'));
+  const wdMax = changes.find(c => c.field.includes('Withdraw GP Max'));
 
   let t = `✅ ${cur} Limit Update Completed\n━━━━━━━━━━━━━━━━━━\n\n`;
 
-  // Deposit section
   t += `💰 Deposit Settings\n`;
-  const depMin = depChanges.find(c => c.field.includes('Min'));
-  const depMax = depChanges.find(c => c.field.includes('Max'));
-  t += `   Min: ${depMin ? depMin.oldVal + ' → ' + depMin.newVal + ' ✅' : allFields.depMin + ' (no change)'}\n`;
-  t += `   Max: ${depMax ? depMax.oldVal + ' → ' + depMax.newVal + ' ✅' : allFields.depMax + ' (no change)'}\n\n`;
+  t += `   Min: ${depMin ? depMin.oldVal + ' → ' + depMin.newVal + ' ✅' : (currentValues.deposit?.minVal || '—') + ' (no change)'}\n`;
+  t += `   Max: ${depMax ? depMax.oldVal + ' → ' + depMax.newVal + ' ✅' : (currentValues.deposit?.maxVal || '—') + ' (no change)'}\n\n`;
 
-  // Withdraw section
   if (withdraw_unavailable) {
     t += `💸 Withdraw Settings\n`;
     t += `   ⛔ Suspended (Insufficient merchant balance)\n\n`;
   } else {
     t += `💸 Withdraw Settings\n`;
     t += `   Range: ${(withdraw_min || 0).toLocaleString()} – ${(withdraw_max || 0).toLocaleString()} ${cur}\n`;
-    const gpMin = wdChanges.find(c => c.field.includes('Min'));
-    const gpMax = wdChanges.find(c => c.field.includes('Max'));
-    t += `   Min GP: ${gpMin ? gpMin.oldVal + ' → ' + gpMin.newVal + ' ✅' : allFields.gpMin + ' (no change)'}\n`;
-    t += `   Max GP: ${gpMax ? gpMax.oldVal + ' → ' + gpMax.newVal + ' ✅' : allFields.gpMax + ' (no change)'}\n\n`;
+    t += `   Min GP: ${wdMin ? wdMin.oldVal + ' → ' + wdMin.newVal + ' ✅' : (currentValues.withdraw?.minVal || '—') + ' (no change)'}\n`;
+    t += `   Max GP: ${wdMax ? wdMax.oldVal + ' → ' + wdMax.newVal + ' ✅' : (currentValues.withdraw?.maxVal || '—') + ' (no change)'}\n\n`;
   }
 
   t += `⏱ ${taipeiNow()}`;
@@ -234,120 +344,23 @@ function taipeiNow() {
   return new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Taipei' });
 }
 
-// ---- Get all current field values for display ----
-function getAllFieldValues(cur, inputData) {
-  let depMin = '—', depMax = '—', gpMin = '—', gpMax = '—';
-
-  if (cur === 'INR') {
-    const f1 = inputData.find(i => i.section.includes('INR') && i.section.includes('GP') && i.label.includes('最低金额'));
-    const f2 = inputData.find(i => i.section.includes('INR') && i.section.includes('GP') && i.label.includes('最高金额'));
-    const f3 = inputData.find(i => i.section.includes('GP') && i.section.includes('INR') && i.label.includes('最低') && i.label.includes('GP'));
-    const f4 = inputData.find(i => i.section.includes('GP') && i.section.includes('INR') && i.label.includes('最高') && i.label.includes('GP'));
-    if (f1) depMin = f1.value; if (f2) depMax = f2.value; if (f3) gpMin = f3.value; if (f4) gpMax = f4.value;
-  }
-  if (cur === 'PKR') {
-    const f1 = inputData.find(i => i.section.includes('储值') && i.label.includes('最低储值'));
-    const f2 = inputData.find(i => i.section.includes('储值') && i.label.includes('最高储值'));
-    const f3 = inputData.find(i => i.section.includes('GP') && i.label.includes('最低') && i.label.includes('GP'));
-    const f4 = inputData.find(i => i.section.includes('GP') && i.label.includes('最高') && i.label.includes('GP'));
-    if (f1) depMin = f1.value; if (f2) depMax = f2.value; if (f3) gpMin = f3.value; if (f4) gpMax = f4.value;
-  }
-  if (cur === 'CNY') {
-    const f1 = inputData.find(i => i.section.includes('储值') && i.label.includes('最低储值'));
-    const f2 = inputData.find(i => i.section.includes('储值') && i.label.includes('最高储值'));
-    const f3 = inputData.find(i => i.label.includes('最低') && i.label.includes('GP'));
-    const f4 = inputData.find(i => i.label.includes('最高') && i.label.includes('GP'));
-    if (f1) depMin = f1.value; if (f2) depMax = f2.value; if (f3) gpMin = f3.value; if (f4) gpMax = f4.value;
-  }
-  return { depMin, depMax, gpMin, gpMax };
-}
-
-// ---- Determine which fields to update ----
-function getFieldUpdates(cur, inputData) {
-  const updates = [];
-  const target = { deposit_min, deposit_max, gp_withdraw_min, gp_withdraw_max, withdraw_unavailable };
-
-  if (cur === 'INR') {
-    const minDep = inputData.find(i => i.section.includes('INR') && i.section.includes('GP') && i.label.includes('最低金额'));
-    const maxDep = inputData.find(i => i.section.includes('INR') && i.section.includes('GP') && i.label.includes('最高金额'));
-    const minGP = inputData.find(i => i.section.includes('GP') && i.section.includes('INR') && i.label.includes('最低') && i.label.includes('GP'));
-    const maxGP = inputData.find(i => i.section.includes('GP') && i.section.includes('INR') && i.label.includes('最高') && i.label.includes('GP'));
-
-    if (minDep && Number(minDep.value) !== target.deposit_min) updates.push({ idx: minDep.idx, field: 'INR→GP Min Deposit', oldVal: minDep.value, newVal: target.deposit_min });
-    if (maxDep && Number(maxDep.value) !== target.deposit_max) updates.push({ idx: maxDep.idx, field: 'INR→GP Max Deposit', oldVal: maxDep.value, newVal: target.deposit_max });
-    if (!target.withdraw_unavailable && target.gp_withdraw_min !== null) {
-      if (minGP && Number(minGP.value) !== target.gp_withdraw_min) updates.push({ idx: minGP.idx, field: 'GP→INR Min GP', oldVal: minGP.value, newVal: target.gp_withdraw_min });
-      if (maxGP && Number(maxGP.value) !== target.gp_withdraw_max) updates.push({ idx: maxGP.idx, field: 'GP→INR Max GP', oldVal: maxGP.value, newVal: target.gp_withdraw_max });
-    }
-  }
-
-  if (cur === 'PKR') {
-    const minDep = inputData.find(i => i.section.includes('储值') && i.label.includes('最低储值'));
-    const maxDep = inputData.find(i => i.section.includes('储值') && i.label.includes('最高储值'));
-    const minGP = inputData.find(i => i.section.includes('GP') && i.label.includes('最低') && i.label.includes('GP'));
-    const maxGP = inputData.find(i => i.section.includes('GP') && i.label.includes('最高') && i.label.includes('GP'));
-
-    if (minDep && Number(minDep.value) !== target.deposit_min) updates.push({ idx: minDep.idx, field: 'PKR Min Deposit', oldVal: minDep.value, newVal: target.deposit_min });
-    if (maxDep && Number(maxDep.value) !== target.deposit_max) updates.push({ idx: maxDep.idx, field: 'PKR Max Deposit', oldVal: maxDep.value, newVal: target.deposit_max });
-    if (!target.withdraw_unavailable && target.gp_withdraw_min !== null) {
-      if (minGP && Number(minGP.value) !== target.gp_withdraw_min) updates.push({ idx: minGP.idx, field: 'GP→PKR Min GP', oldVal: minGP.value, newVal: target.gp_withdraw_min });
-      if (maxGP && Number(maxGP.value) !== target.gp_withdraw_max) updates.push({ idx: maxGP.idx, field: 'GP→PKR Max GP', oldVal: maxGP.value, newVal: target.gp_withdraw_max });
-    }
-  }
-
-  if (cur === 'CNY') {
-    const minDep = inputData.find(i => i.section.includes('储值') && i.label.includes('最低储值'));
-    const maxDep = inputData.find(i => i.section.includes('储值') && i.label.includes('最高储值'));
-    const minGP = inputData.find(i => i.label.includes('最低') && i.label.includes('GP'));
-    const maxGP = inputData.find(i => i.label.includes('最高') && i.label.includes('GP'));
-
-    if (minDep && Number(minDep.value) !== target.deposit_min) updates.push({ idx: minDep.idx, field: 'CNY Min Deposit', oldVal: minDep.value, newVal: target.deposit_min });
-    if (maxDep && Number(maxDep.value) !== target.deposit_max) updates.push({ idx: maxDep.idx, field: 'CNY Max Deposit', oldVal: maxDep.value, newVal: target.deposit_max });
-    if (!target.withdraw_unavailable && target.gp_withdraw_min !== null) {
-      if (minGP && Number(minGP.value) !== target.gp_withdraw_min) updates.push({ idx: minGP.idx, field: 'CNY↔GP Min Withdraw GP', oldVal: minGP.value, newVal: target.gp_withdraw_min });
-      if (maxGP && Number(maxGP.value) !== target.gp_withdraw_max) updates.push({ idx: maxGP.idx, field: 'CNY↔GP Max Withdraw GP', oldVal: maxGP.value, newVal: target.gp_withdraw_max });
-    }
-  }
-
-  return updates;
-}
-
-// ---- Section selectors per currency ----
-function getSectionSelectors(cur) {
-  if (cur === 'INR') {
-    return {
-      deposit: 'INR → GP',   // h3 text to find deposit card
-      withdraw: 'GP → INR',  // h3 text to find withdraw card
-    };
-  }
-  if (cur === 'PKR') {
-    return {
-      deposit: '储值设定',     // deposit settings card
-      withdraw: 'GP → PKR',  // withdraw card
-    };
-  }
-  if (cur === 'CNY') {
-    return {
-      deposit: '储值设定',
-      withdraw: 'CNY ↔ GP',
-    };
-  }
-  return { deposit: null, withdraw: null };
-}
-
-// ---- Scroll to a section and take screenshot ----
-async function scrollAndScreenshot(page, sectionTitle, label) {
-  if (sectionTitle) {
+// ---- Scroll to a card by its title and take screenshot ----
+async function scrollAndScreenshot(page, cardTitle, label) {
+  if (cardTitle) {
     await page.evaluate((title) => {
-      const headings = Array.from(document.querySelectorAll('h3, h2'));
-      const target = headings.find(h => h.innerText.trim().includes(title));
+      const all = Array.from(document.querySelectorAll('*'));
+      const target = all.find(el => {
+        const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
+        return own === title;
+      });
       if (target) {
-        // Scroll the section card into view
-        const card = target.closest('div') || target.parentElement;
-        if (card) card.scrollIntoView({ behavior: 'instant', block: 'start' });
-        else target.scrollIntoView({ behavior: 'instant', block: 'start' });
+        let scrollTarget = target;
+        for (let i = 0; i < 3; i++) {
+          if (scrollTarget.parentElement) scrollTarget = scrollTarget.parentElement;
+        }
+        scrollTarget.scrollIntoView({ behavior: 'instant', block: 'start' });
       }
-    }, sectionTitle);
+    }, cardTitle);
     await page.waitForTimeout(800);
   }
   console.log(`[${uid}] Screenshot: ${label}`);
@@ -361,7 +374,6 @@ async function sendMediaGroup(depositBuf, withdrawBuf, caption) {
   if (replyToMsgId) {
     form.append('reply_to_message_id', String(replyToMsgId));
   }
-  // Media group: first photo gets the caption
   form.append('media', JSON.stringify([
     { type: 'photo', media: 'attach://deposit', caption: caption },
     { type: 'photo', media: 'attach://withdraw' },
