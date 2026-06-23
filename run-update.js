@@ -40,11 +40,14 @@ const withdraw_unavailable = withdraw.unavailable || false;
 const gp_withdraw_min = gp_withdraw.min;
 const gp_withdraw_max = gp_withdraw.max;
 
-// Card titles that contain the 额度限制 sub-block per currency
+// Card titles that contain the 额度限制 sub-block per currency.
+// If deposit is null, the currency's deposit is fixed denominations — we skip deposit updates.
 const CARD_MAP = {
-  INR: { deposit: 'INR → GP', withdraw: 'GP → INR' },
-  PKR: { deposit: '储值设定', withdraw: 'GP → PKR' },
-  CNY: { deposit: '储值设定', withdraw: 'CNY ↔ GP' },
+  INR: { deposit: 'INR → GP',  withdraw: 'GP → INR'  },
+  PKR: { deposit: '储值设定',   withdraw: 'GP → PKR'  },
+  CNY: { deposit: '储值设定',   withdraw: 'CNY ↔ GP'  },
+  THB: { deposit: '储值设定',   withdraw: 'THB ↔ GP'  },
+  USD: { deposit: null,        withdraw: 'USD ↔ GP'  },  // USD: fixed deposit denominations
 };
 
 async function main() {
@@ -107,6 +110,7 @@ async function main() {
 
     const currentValues = await page.evaluate((cards) => {
       function findLimitInputs(cardTitle) {
+        if (!cardTitle) return null;
         const all = Array.from(document.querySelectorAll('*'));
         const headings = all.filter(el => {
           const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
@@ -145,7 +149,8 @@ async function main() {
     }, cards);
 
     console.log(`[${uid}] Current values: ${JSON.stringify(currentValues)}`);
-    if (!currentValues.deposit) throw new Error(`Cannot find deposit card "${cards.deposit}"`);
+    // Only require deposit card if this currency has one (USD has cards.deposit = null)
+    if (cards.deposit && !currentValues.deposit) throw new Error(`Cannot find deposit card "${cards.deposit}"`);
     if (!currentValues.withdraw && !withdraw_unavailable) throw new Error(`Cannot find withdraw card "${cards.withdraw}"`);
 
     // ---- Step 6: Build list of individual field updates ----
@@ -153,14 +158,17 @@ async function main() {
     //   "如果同時修改最高值跟最低值 先把最高值設定然後按一次儲存 再設置最低值按一次儲存"
     // So we save MAX first, then MIN, for each card.
     const fieldUpdates = [];
-    const depMinOld = Number(currentValues.deposit.minVal);
-    const depMaxOld = Number(currentValues.deposit.maxVal);
 
-    if (depMaxOld !== deposit_max) {
-      fieldUpdates.push({ cardTitle: cards.deposit, fieldIdx: 1, kind: 'depositMax', oldVal: currentValues.deposit.maxVal, newVal: deposit_max });
-    }
-    if (depMinOld !== deposit_min) {
-      fieldUpdates.push({ cardTitle: cards.deposit, fieldIdx: 0, kind: 'depositMin', oldVal: currentValues.deposit.minVal, newVal: deposit_min });
+    // Deposit updates — skipped entirely if this currency has fixed denominations (USD)
+    if (cards.deposit && currentValues.deposit && deposit_min !== null && deposit_max !== null) {
+      const depMinOld = Number(currentValues.deposit.minVal);
+      const depMaxOld = Number(currentValues.deposit.maxVal);
+      if (depMaxOld !== deposit_max) {
+        fieldUpdates.push({ cardTitle: cards.deposit, fieldIdx: 1, kind: 'depositMax', oldVal: currentValues.deposit.maxVal, newVal: deposit_max });
+      }
+      if (depMinOld !== deposit_min) {
+        fieldUpdates.push({ cardTitle: cards.deposit, fieldIdx: 0, kind: 'depositMin', oldVal: currentValues.deposit.minVal, newVal: deposit_min });
+      }
     }
 
     if (!withdraw_unavailable && currentValues.withdraw) {
@@ -176,10 +184,8 @@ async function main() {
 
     if (fieldUpdates.length === 0) {
       console.log(`[${uid}] No changes needed`);
-      const depositShot = await scrollAndScreenshot(page, cards.deposit, `${currency} Deposit`);
-      const withdrawShot = await scrollAndScreenshot(page, cards.withdraw, `${currency} Withdraw`);
       const caption = `✅ ${currency} — No changes needed, values are already correct.\n⏱ ${taipeiNow()}`;
-      await sendMediaGroup(depositShot, withdrawShot, caption);
+      await sendCardScreenshots(page, cards, caption);
       return;
     }
 
@@ -199,10 +205,8 @@ async function main() {
     // ---- Step 8: Screenshots + report ----
     console.log(`[${uid}] Taking screenshots...`);
     await page.waitForTimeout(1000);
-    const depositShot = await scrollAndScreenshot(page, cards.deposit, `${currency} Deposit`);
-    const withdrawShot = await scrollAndScreenshot(page, cards.withdraw, `${currency} Withdraw`);
     const caption = buildCaption(currency, changes, currentValues);
-    await sendMediaGroup(depositShot, withdrawShot, caption);
+    await sendCardScreenshots(page, cards, caption);
     console.log(`[${uid}] Done!`);
 
   } catch (err) {
@@ -321,9 +325,14 @@ function buildCaption(cur, changes, currentValues) {
 
   let t = `✅ ${cur} Limit Update Completed\n━━━━━━━━━━━━━━━━━━\n\n`;
 
-  t += `💰 Deposit Settings\n`;
-  t += `   Min: ${depMin ? depMin.oldVal + ' → ' + depMin.newVal + ' ✅' : (currentValues.deposit?.minVal || '—') + ' (no change)'}\n`;
-  t += `   Max: ${depMax ? depMax.oldVal + ' → ' + depMax.newVal + ' ✅' : (currentValues.deposit?.maxVal || '—') + ' (no change)'}\n\n`;
+  // Deposit (skipped for USD — fixed denominations)
+  if (currentValues.deposit) {
+    t += `💰 Deposit Settings\n`;
+    t += `   Min: ${depMin ? depMin.oldVal + ' → ' + depMin.newVal + ' ✅' : (currentValues.deposit?.minVal || '—') + ' (no change)'}\n`;
+    t += `   Max: ${depMax ? depMax.oldVal + ' → ' + depMax.newVal + ' ✅' : (currentValues.deposit?.maxVal || '—') + ' (no change)'}\n\n`;
+  } else {
+    t += `💰 Deposit: Fixed denominations (not auto-updated)\n\n`;
+  }
 
   if (withdraw_unavailable) {
     t += `💸 Withdraw Settings\n`;
@@ -337,6 +346,19 @@ function buildCaption(cur, changes, currentValues) {
 
   t += `⏱ ${taipeiNow()}`;
   return t;
+}
+
+// ---- Send card screenshots (one or two cards depending on whether deposit is skipped) ----
+async function sendCardScreenshots(page, cards, caption) {
+  const withdrawShot = await scrollAndScreenshot(page, cards.withdraw, `${currency} Withdraw`);
+  if (cards.deposit) {
+    // Two cards → media group (album)
+    const depositShot = await scrollAndScreenshot(page, cards.deposit, `${currency} Deposit`);
+    await sendMediaGroup(depositShot, withdrawShot, caption);
+  } else {
+    // USD: only withdraw card → single photo
+    await sendSinglePhoto(withdrawShot, caption);
+  }
 }
 
 // ---- Format current time in Taipei timezone (GMT+8) ----
