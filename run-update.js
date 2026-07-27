@@ -121,16 +121,12 @@ async function main() {
     if (!cards) throw new Error(`No card mapping for currency ${currency}`);
 
     const currentValues = await page.evaluate((cardsSpec) => {
-      // All known card titles — used to detect if we walked up too far and hit a wrapper containing multiple cards
-      const ALL_CARDS = ['储值设定', '提领设定', '总开关', 'INR → GP', 'GP → INR', 'INR ↔ GP', 'PKR → GP', 'GP → PKR', 'PKR ↔ GP', 'CNY ↔ GP', 'CNY → GP', 'GP → CNY', 'THB ↔ GP', 'THB → GP', 'GP → THB', 'USD ↔ GP', 'USD → GP', 'GP → USD', '兑换设定'];
-
-      function containsOtherCardTitle(el, targetTitle) {
-        const desc = Array.from(el.querySelectorAll('*'));
-        for (const d of desc) {
-          const own = Array.from(d.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
-          if (own !== targetTitle && ALL_CARDS.includes(own)) return true;
-        }
-        return false;
+      // Count "额度限制"-suffix sub-headings within an element
+      function countLimitSubHeadings(el) {
+        return Array.from(el.querySelectorAll('*')).filter(x => {
+          const own = Array.from(x.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
+          return /额度限制$/.test(own);
+        }).length;
       }
 
       function findLimitInputsForTitle(cardTitle) {
@@ -142,31 +138,43 @@ async function main() {
         });
         for (const heading of headings) {
           let card = heading.parentElement;
-          for (let i = 0; i < 8; i++) {
+          let bestCard = null;
+          // Walk up looking for the SMALLEST wrapper that contains:
+          //   1. Some 额度限制/提款额度限制 sub-heading, AND
+          //   2. Only ONE such sub-heading (so we know we're in a single card, not a multi-card wrapper)
+          // Use textContent so we don't miss collapsed/hidden text.
+          for (let i = 0; i < 10; i++) {
             if (!card) break;
-            if (/额度限制/.test(card.innerText) && card.innerText.includes('单笔交易的下限与上限')) {
-              // SAFETY: if this wrapper contains OTHER card titles, we walked too far — bail out
-              if (containsOtherCardTitle(card, cardTitle)) {
-                return null;
+            if (/额度限制/.test(card.textContent)) {
+              const count = countLimitSubHeadings(card);
+              if (count === 1) {
+                bestCard = card;
+                break; // smallest wrapper found
               }
-              // Sub-heading matches "额度限制" or "提款额度限制" (or anything ending with 额度限制)
-              const subHeadings = Array.from(card.querySelectorAll('*')).filter(el => {
-                const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
-                return /额度限制$/.test(own);
-              });
-              for (const sh of subHeadings) {
-                let block = sh.parentElement;
-                for (let j = 0; j < 8; j++) {
-                  if (!block) break;
-                  const inps = block.querySelectorAll('input[type="number"]');
-                  if (inps.length >= 2) {
-                    return { minVal: inps[0].value, maxVal: inps[1].value, matchedTitle: cardTitle };
-                  }
-                  block = block.parentElement;
-                }
+              if (count > 1) {
+                // Walked into a wrapper that contains multiple cards → back off
+                break;
               }
             }
             card = card.parentElement;
+          }
+          if (!bestCard) continue;
+
+          // Sub-heading matches "额度限制" or "提款额度限制" (anything ending with 额度限制)
+          const subHeadings = Array.from(bestCard.querySelectorAll('*')).filter(el => {
+            const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
+            return /额度限制$/.test(own);
+          });
+          for (const sh of subHeadings) {
+            let block = sh.parentElement;
+            for (let j = 0; j < 8; j++) {
+              if (!block) break;
+              const inps = block.querySelectorAll('input[type="number"]');
+              if (inps.length >= 2) {
+                return { minVal: inps[0].value, maxVal: inps[1].value, matchedTitle: cardTitle };
+              }
+              block = block.parentElement;
+            }
           }
         }
         return null;
@@ -271,17 +279,13 @@ async function main() {
 async function applyFieldUpdate(page, cardTitle, fieldIdx, newVal) {
   // Step 1: change the value in browser context
   const changed = await page.evaluate(({ cardTitle, fieldIdx, newVal }) => {
-    // SAFETY: known card titles used to detect when we walked up too far
-    const ALL_CARDS = ['储值设定', '提领设定', '总开关', 'INR → GP', 'GP → INR', 'INR ↔ GP', 'PKR → GP', 'GP → PKR', 'PKR ↔ GP', 'CNY ↔ GP', 'CNY → GP', 'GP → CNY', 'THB ↔ GP', 'THB → GP', 'GP → THB', 'USD ↔ GP', 'USD → GP', 'GP → USD', '兑换设定'];
-
-      function containsOtherCardTitle(el, targetTitle) {
-        const desc = Array.from(el.querySelectorAll('*'));
-        for (const d of desc) {
-          const own = Array.from(d.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
-          if (own !== targetTitle && ALL_CARDS.includes(own)) return true;
-        }
-        return false;
-      }
+    // Count "额度限制"-suffix sub-headings within an element
+    function countLimitSubHeadings(el) {
+      return Array.from(el.querySelectorAll('*')).filter(x => {
+        const own = Array.from(x.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
+        return /额度限制$/.test(own);
+      }).length;
+    }
 
     const all = Array.from(document.querySelectorAll('*'));
     const headings = all.filter(el => {
@@ -290,39 +294,42 @@ async function applyFieldUpdate(page, cardTitle, fieldIdx, newVal) {
     });
     for (const heading of headings) {
       let card = heading.parentElement;
-      for (let i = 0; i < 8; i++) {
+      let bestCard = null;
+      // Walk up looking for the SMALLEST wrapper that contains exactly ONE 额度限制 sub-heading.
+      // This means we're inside a single card — safe to write.
+      for (let i = 0; i < 10; i++) {
         if (!card) break;
-        if (/额度限制/.test(card.innerText) && card.innerText.includes('单笔交易的下限与上限')) {
-          // SAFETY: if this wrapper contains OTHER card titles, we walked too far — abort so we don't write to wrong card
-          if (containsOtherCardTitle(card, cardTitle)) {
-            return false;
-          }
-          // Sub-heading matches "额度限制" or "提款额度限制" (or anything ending with 额度限制)
-          const subHeadings = Array.from(card.querySelectorAll('*')).filter(el => {
-            const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
-            return /额度限制$/.test(own);
-          });
-          for (const sh of subHeadings) {
-            let block = sh.parentElement;
-            for (let j = 0; j < 8; j++) {
-              if (!block) break;
-              const inps = block.querySelectorAll('input[type="number"]');
-              if (inps.length >= 2) {
-                const target = inps[fieldIdx];
-                const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                nativeSetter.call(target, String(newVal));
-                target.dispatchEvent(new Event('input', { bubbles: true }));
-                target.dispatchEvent(new Event('change', { bubbles: true }));
-                target.dispatchEvent(new Event('blur', { bubbles: true }));
-                // Mark this block so we can find it again to click 储存
-                block.setAttribute('data-vf-active', '1');
-                return true;
-              }
-              block = block.parentElement;
-            }
-          }
+        if (/额度限制/.test(card.textContent)) {
+          const count = countLimitSubHeadings(card);
+          if (count === 1) { bestCard = card; break; }
+          if (count > 1) { break; } // walked into multi-card wrapper — abort
         }
         card = card.parentElement;
+      }
+      if (!bestCard) continue;
+
+      const subHeadings = Array.from(bestCard.querySelectorAll('*')).filter(el => {
+        const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
+        return /额度限制$/.test(own);
+      });
+      for (const sh of subHeadings) {
+        let block = sh.parentElement;
+        for (let j = 0; j < 8; j++) {
+          if (!block) break;
+          const inps = block.querySelectorAll('input[type="number"]');
+          if (inps.length >= 2) {
+            const target = inps[fieldIdx];
+            const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            nativeSetter.call(target, String(newVal));
+            target.dispatchEvent(new Event('input', { bubbles: true }));
+            target.dispatchEvent(new Event('change', { bubbles: true }));
+            target.dispatchEvent(new Event('blur', { bubbles: true }));
+            // Mark this block so we can find the 储存 button later
+            block.setAttribute('data-vf-active', '1');
+            return true;
+          }
+          block = block.parentElement;
+        }
       }
     }
     return false;
@@ -466,37 +473,30 @@ async function scrollAndScreenshot(page, cardTitle, label) {
       return own === title;
     });
 
-    // SAFETY list — used to detect if screenshot target walked up too far
-    const ALL_CARDS_SHOT = ['储值设定', '提领设定', '总开关', 'INR → GP', 'GP → INR', 'INR ↔ GP', 'PKR → GP', 'GP → PKR', 'PKR ↔ GP', 'CNY ↔ GP', 'CNY → GP', 'GP → CNY', 'THB ↔ GP', 'THB → GP', 'GP → THB', 'USD ↔ GP', 'USD → GP', 'GP → USD', '兑换设定'];
-    function containsOtherCardTitleShot(el, targetTitle) {
-      const desc = Array.from(el.querySelectorAll('*'));
-      for (const d of desc) {
-        const own = Array.from(d.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
-        if (own !== targetTitle && ALL_CARDS_SHOT.includes(own)) return true;
-      }
-      return false;
+    // Count "额度限制"-suffix sub-headings within an element
+    function countLimitSubHeadingsShot(el) {
+      return Array.from(el.querySelectorAll('*')).filter(x => {
+        const own = Array.from(x.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
+        return /额度限制$/.test(own);
+      }).length;
     }
 
     for (const heading of headings) {
       let card = heading.parentElement;
+      let bestCard = null;
       for (let i = 0; i < 10; i++) {
         if (!card) break;
-        // The actual card container holds both the title AND the 额度限制 (or 提款额度限制) block.
-        // We pick the smallest such container.
-        if (card.innerText.includes(title)
-            && /额度限制/.test(card.innerText)
-            && card.innerText.includes('单笔交易的下限与上限')) {
-          // SAFETY: if this wrapper contains OTHER card titles, we walked too far — skip
-          if (containsOtherCardTitleShot(card, title)) {
-            card = card.parentElement;
-            continue;
-          }
-          card.setAttribute('data-vf-shot', '1');
-          // Scroll it into view so the screenshot reliably captures it
-          card.scrollIntoView({ behavior: 'instant', block: 'start' });
-          return true;
+        if (/额度限制/.test(card.textContent)) {
+          const count = countLimitSubHeadingsShot(card);
+          if (count === 1) { bestCard = card; break; }
+          if (count > 1) { break; }
         }
         card = card.parentElement;
+      }
+      if (bestCard) {
+        bestCard.setAttribute('data-vf-shot', '1');
+        bestCard.scrollIntoView({ behavior: 'instant', block: 'start' });
+        return true;
       }
     }
     return false;
