@@ -40,15 +40,27 @@ const withdraw_unavailable = withdraw.unavailable || false;
 const gp_withdraw_min = gp_withdraw.min;
 const gp_withdraw_max = gp_withdraw.max;
 
-// Card titles that contain the 额度限制 sub-block per currency.
+// Card titles that contain the 额度限制 (or 提款额度限制) sub-block per currency.
+// Each field can be a single string OR an array of alternatives (for handling backend renames).
 // If deposit is null, the currency's deposit is fixed denominations — we skip deposit updates.
 const CARD_MAP = {
-  INR: { deposit: 'INR → GP',  withdraw: 'GP → INR'  },
-  PKR: { deposit: '储值设定',   withdraw: 'GP → PKR'  },
-  CNY: { deposit: '储值设定',   withdraw: 'CNY ↔ GP'  },
-  THB: { deposit: '储值设定',   withdraw: 'THB ↔ GP'  },
-  USD: { deposit: null,        withdraw: 'USD ↔ GP'  },  // USD: fixed deposit denominations
+  INR: { deposit: ['INR → GP', '储值设定'],   withdraw: ['INR ↔ GP', 'GP → INR']  },
+  PKR: { deposit: '储值设定',                  withdraw: ['PKR ↔ GP', 'GP → PKR']  },
+  CNY: { deposit: '储值设定',                  withdraw: ['CNY ↔ GP', 'GP → CNY']  },
+  THB: { deposit: '储值设定',                  withdraw: ['THB ↔ GP', 'GP → THB']  },
+  USD: { deposit: null,                       withdraw: ['USD ↔ GP', 'GP → USD']  },
 };
+
+// Normalize a title spec (string or array) into an array
+function titleList(spec) {
+  if (!spec) return [];
+  return Array.isArray(spec) ? spec : [spec];
+}
+
+// Sub-block heading that holds the min/max inputs. Backend renamed
+// deposit's is still "额度限制", withdraw's is now "提款额度限制".
+// Accept either — anything ending with "额度限制".
+const LIMIT_SUBHEADING_REGEX = /额度限制$/;
 
 async function main() {
   console.log(`[${uid}] Starting update for ${currency}...`);
@@ -108,9 +120,9 @@ async function main() {
     const cards = CARD_MAP[currency];
     if (!cards) throw new Error(`No card mapping for currency ${currency}`);
 
-    const currentValues = await page.evaluate((cards) => {
+    const currentValues = await page.evaluate((cardsSpec) => {
       // All known card titles — used to detect if we walked up too far and hit a wrapper containing multiple cards
-      const ALL_CARDS = ['储值设定', '提领设定', '总开关', 'INR → GP', 'GP → INR', 'PKR → GP', 'GP → PKR', 'CNY ↔ GP', 'CNY → GP', 'GP → CNY', 'THB ↔ GP', 'THB → GP', 'GP → THB', 'USD ↔ GP', 'USD → GP', 'GP → USD', '兑换设定'];
+      const ALL_CARDS = ['储值设定', '提领设定', '总开关', 'INR → GP', 'GP → INR', 'INR ↔ GP', 'PKR → GP', 'GP → PKR', 'PKR ↔ GP', 'CNY ↔ GP', 'CNY → GP', 'GP → CNY', 'THB ↔ GP', 'THB → GP', 'GP → THB', 'USD ↔ GP', 'USD → GP', 'GP → USD', '兑换设定'];
 
       function containsOtherCardTitle(el, targetTitle) {
         const desc = Array.from(el.querySelectorAll('*'));
@@ -121,7 +133,7 @@ async function main() {
         return false;
       }
 
-      function findLimitInputs(cardTitle) {
+      function findLimitInputsForTitle(cardTitle) {
         if (!cardTitle) return null;
         const all = Array.from(document.querySelectorAll('*'));
         const headings = all.filter(el => {
@@ -132,14 +144,15 @@ async function main() {
           let card = heading.parentElement;
           for (let i = 0; i < 8; i++) {
             if (!card) break;
-            if (card.innerText.includes('额度限制') && card.innerText.includes('单笔交易的下限与上限')) {
+            if (/额度限制/.test(card.innerText) && card.innerText.includes('单笔交易的下限与上限')) {
               // SAFETY: if this wrapper contains OTHER card titles, we walked too far — bail out
               if (containsOtherCardTitle(card, cardTitle)) {
                 return null;
               }
+              // Sub-heading matches "额度限制" or "提款额度限制" (or anything ending with 额度限制)
               const subHeadings = Array.from(card.querySelectorAll('*')).filter(el => {
                 const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
-                return own === '额度限制';
+                return /额度限制$/.test(own);
               });
               for (const sh of subHeadings) {
                 let block = sh.parentElement;
@@ -147,7 +160,7 @@ async function main() {
                   if (!block) break;
                   const inps = block.querySelectorAll('input[type="number"]');
                   if (inps.length >= 2) {
-                    return { minVal: inps[0].value, maxVal: inps[1].value };
+                    return { minVal: inps[0].value, maxVal: inps[1].value, matchedTitle: cardTitle };
                   }
                   block = block.parentElement;
                 }
@@ -158,16 +171,31 @@ async function main() {
         }
         return null;
       }
+
+      // Try each candidate title until one works
+      function findLimitInputs(titleSpec) {
+        const titles = Array.isArray(titleSpec) ? titleSpec : (titleSpec ? [titleSpec] : []);
+        for (const t of titles) {
+          const found = findLimitInputsForTitle(t);
+          if (found) return found;
+        }
+        return null;
+      }
+
       return {
-        deposit: findLimitInputs(cards.deposit),
-        withdraw: findLimitInputs(cards.withdraw),
+        deposit: findLimitInputs(cardsSpec.deposit),
+        withdraw: findLimitInputs(cardsSpec.withdraw),
       };
     }, cards);
 
     console.log(`[${uid}] Current values: ${JSON.stringify(currentValues)}`);
     // Only require deposit card if this currency has one (USD has cards.deposit = null)
-    if (cards.deposit && !currentValues.deposit) throw new Error(`Cannot find deposit card "${cards.deposit}"`);
-    if (!currentValues.withdraw && !withdraw_unavailable) throw new Error(`Cannot find withdraw card "${cards.withdraw}"`);
+    if (cards.deposit && !currentValues.deposit) throw new Error(`Cannot find deposit card "${JSON.stringify(cards.deposit)}"`);
+    if (!currentValues.withdraw && !withdraw_unavailable) throw new Error(`Cannot find withdraw card "${JSON.stringify(cards.withdraw)}"`);
+
+    // Use the ACTUAL matched card title for updates (may differ from primary spec if backend renamed)
+    const depositCardTitle = currentValues.deposit?.matchedTitle || (Array.isArray(cards.deposit) ? cards.deposit[0] : cards.deposit);
+    const withdrawCardTitle = currentValues.withdraw?.matchedTitle || (Array.isArray(cards.withdraw) ? cards.withdraw[0] : cards.withdraw);
 
     // ---- Step 6: Build list of individual field updates ----
     // Each update is ONE field (min or max). User instruction:
@@ -180,10 +208,10 @@ async function main() {
       const depMinOld = Number(currentValues.deposit.minVal);
       const depMaxOld = Number(currentValues.deposit.maxVal);
       if (depMaxOld !== deposit_max) {
-        fieldUpdates.push({ cardTitle: cards.deposit, fieldIdx: 1, kind: 'depositMax', oldVal: currentValues.deposit.maxVal, newVal: deposit_max });
+        fieldUpdates.push({ cardTitle: depositCardTitle, fieldIdx: 1, kind: 'depositMax', oldVal: currentValues.deposit.maxVal, newVal: deposit_max });
       }
       if (depMinOld !== deposit_min) {
-        fieldUpdates.push({ cardTitle: cards.deposit, fieldIdx: 0, kind: 'depositMin', oldVal: currentValues.deposit.minVal, newVal: deposit_min });
+        fieldUpdates.push({ cardTitle: depositCardTitle, fieldIdx: 0, kind: 'depositMin', oldVal: currentValues.deposit.minVal, newVal: deposit_min });
       }
     }
 
@@ -191,10 +219,10 @@ async function main() {
       const wdMinOld = Number(currentValues.withdraw.minVal);
       const wdMaxOld = Number(currentValues.withdraw.maxVal);
       if (wdMaxOld !== gp_withdraw_max) {
-        fieldUpdates.push({ cardTitle: cards.withdraw, fieldIdx: 1, kind: 'withdrawMax', oldVal: currentValues.withdraw.maxVal, newVal: gp_withdraw_max });
+        fieldUpdates.push({ cardTitle: withdrawCardTitle, fieldIdx: 1, kind: 'withdrawMax', oldVal: currentValues.withdraw.maxVal, newVal: gp_withdraw_max });
       }
       if (wdMinOld !== gp_withdraw_min) {
-        fieldUpdates.push({ cardTitle: cards.withdraw, fieldIdx: 0, kind: 'withdrawMin', oldVal: currentValues.withdraw.minVal, newVal: gp_withdraw_min });
+        fieldUpdates.push({ cardTitle: withdrawCardTitle, fieldIdx: 0, kind: 'withdrawMin', oldVal: currentValues.withdraw.minVal, newVal: gp_withdraw_min });
       }
     }
 
@@ -244,7 +272,7 @@ async function applyFieldUpdate(page, cardTitle, fieldIdx, newVal) {
   // Step 1: change the value in browser context
   const changed = await page.evaluate(({ cardTitle, fieldIdx, newVal }) => {
     // SAFETY: known card titles used to detect when we walked up too far
-    const ALL_CARDS = ['储值设定', '提领设定', '总开关', 'INR → GP', 'GP → INR', 'PKR → GP', 'GP → PKR', 'CNY ↔ GP', 'CNY → GP', 'GP → CNY', 'THB ↔ GP', 'THB → GP', 'GP → THB', 'USD ↔ GP', 'USD → GP', 'GP → USD', '兑换设定'];
+    const ALL_CARDS = ['储值设定', '提领设定', '总开关', 'INR → GP', 'GP → INR', 'INR ↔ GP', 'PKR → GP', 'GP → PKR', 'PKR ↔ GP', 'CNY ↔ GP', 'CNY → GP', 'GP → CNY', 'THB ↔ GP', 'THB → GP', 'GP → THB', 'USD ↔ GP', 'USD → GP', 'GP → USD', '兑换设定'];
 
       function containsOtherCardTitle(el, targetTitle) {
         const desc = Array.from(el.querySelectorAll('*'));
@@ -264,14 +292,15 @@ async function applyFieldUpdate(page, cardTitle, fieldIdx, newVal) {
       let card = heading.parentElement;
       for (let i = 0; i < 8; i++) {
         if (!card) break;
-        if (card.innerText.includes('额度限制') && card.innerText.includes('单笔交易的下限与上限')) {
+        if (/额度限制/.test(card.innerText) && card.innerText.includes('单笔交易的下限与上限')) {
           // SAFETY: if this wrapper contains OTHER card titles, we walked too far — abort so we don't write to wrong card
           if (containsOtherCardTitle(card, cardTitle)) {
             return false;
           }
+          // Sub-heading matches "额度限制" or "提款额度限制" (or anything ending with 额度限制)
           const subHeadings = Array.from(card.querySelectorAll('*')).filter(el => {
             const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
-            return own === '额度限制';
+            return /额度限制$/.test(own);
           });
           for (const sh of subHeadings) {
             let block = sh.parentElement;
@@ -381,16 +410,37 @@ function buildCaption(cur, changes, currentValues) {
 }
 
 // ---- Send card screenshots (one or two cards depending on whether deposit is skipped) ----
+// Handles array titles: tries each candidate until one works.
 async function sendCardScreenshots(page, cards, caption) {
-  const withdrawShot = await scrollAndScreenshot(page, cards.withdraw, `${currency} Withdraw`);
+  const withdrawShot = await scrollAndScreenshotAny(page, cards.withdraw, `${currency} Withdraw`);
   if (cards.deposit) {
     // Two cards → media group (album)
-    const depositShot = await scrollAndScreenshot(page, cards.deposit, `${currency} Deposit`);
+    const depositShot = await scrollAndScreenshotAny(page, cards.deposit, `${currency} Deposit`);
     await sendMediaGroup(depositShot, withdrawShot, caption);
   } else {
     // USD: only withdraw card → single photo
     await sendSinglePhoto(withdrawShot, caption);
   }
+}
+
+// Try each candidate title until we get a real element screenshot (not fallback viewport)
+async function scrollAndScreenshotAny(page, titleSpec, label) {
+  const titles = Array.isArray(titleSpec) ? titleSpec : (titleSpec ? [titleSpec] : [null]);
+  for (const t of titles) {
+    // Check if this title can be found first
+    const found = await page.evaluate((title) => {
+      if (!title) return false;
+      const all = Array.from(document.querySelectorAll('*'));
+      return all.some(el => {
+        const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
+        return own === title;
+      });
+    }, t);
+    if (found || t === titles[titles.length - 1]) {
+      return await scrollAndScreenshot(page, t, label);
+    }
+  }
+  return await page.screenshot({ fullPage: false });
 }
 
 // ---- Format current time in Taipei timezone (GMT+8) ----
@@ -417,7 +467,7 @@ async function scrollAndScreenshot(page, cardTitle, label) {
     });
 
     // SAFETY list — used to detect if screenshot target walked up too far
-    const ALL_CARDS_SHOT = ['储值设定', '提领设定', '总开关', 'INR → GP', 'GP → INR', 'PKR → GP', 'GP → PKR', 'CNY ↔ GP', 'CNY → GP', 'GP → CNY', 'THB ↔ GP', 'THB → GP', 'GP → THB', 'USD ↔ GP', 'USD → GP', 'GP → USD', '兑换设定'];
+    const ALL_CARDS_SHOT = ['储值设定', '提领设定', '总开关', 'INR → GP', 'GP → INR', 'INR ↔ GP', 'PKR → GP', 'GP → PKR', 'PKR ↔ GP', 'CNY ↔ GP', 'CNY → GP', 'GP → CNY', 'THB ↔ GP', 'THB → GP', 'GP → THB', 'USD ↔ GP', 'USD → GP', 'GP → USD', '兑换设定'];
     function containsOtherCardTitleShot(el, targetTitle) {
       const desc = Array.from(el.querySelectorAll('*'));
       for (const d of desc) {
@@ -431,10 +481,10 @@ async function scrollAndScreenshot(page, cardTitle, label) {
       let card = heading.parentElement;
       for (let i = 0; i < 10; i++) {
         if (!card) break;
-        // The actual card container holds both the title AND the 额度限制 block.
+        // The actual card container holds both the title AND the 额度限制 (or 提款额度限制) block.
         // We pick the smallest such container.
         if (card.innerText.includes(title)
-            && card.innerText.includes('额度限制')
+            && /额度限制/.test(card.innerText)
             && card.innerText.includes('单笔交易的下限与上限')) {
           // SAFETY: if this wrapper contains OTHER card titles, we walked too far — skip
           if (containsOtherCardTitleShot(card, title)) {
