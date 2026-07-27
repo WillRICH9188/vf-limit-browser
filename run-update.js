@@ -109,6 +109,18 @@ async function main() {
     if (!cards) throw new Error(`No card mapping for currency ${currency}`);
 
     const currentValues = await page.evaluate((cards) => {
+      // All known card titles — used to detect if we walked up too far and hit a wrapper containing multiple cards
+      const ALL_CARDS = ['储值设定', '提领设定', '总开关', 'INR → GP', 'GP → INR', 'PKR → GP', 'GP → PKR', 'CNY ↔ GP', 'CNY → GP', 'GP → CNY', 'THB ↔ GP', 'THB → GP', 'GP → THB', 'USD ↔ GP', 'USD → GP', 'GP → USD', '兑换设定'];
+
+      function containsOtherCardTitle(el, targetTitle) {
+        const desc = Array.from(el.querySelectorAll('*'));
+        for (const d of desc) {
+          const own = Array.from(d.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
+          if (own !== targetTitle && ALL_CARDS.includes(own)) return true;
+        }
+        return false;
+      }
+
       function findLimitInputs(cardTitle) {
         if (!cardTitle) return null;
         const all = Array.from(document.querySelectorAll('*'));
@@ -121,6 +133,10 @@ async function main() {
           for (let i = 0; i < 8; i++) {
             if (!card) break;
             if (card.innerText.includes('额度限制') && card.innerText.includes('单笔交易的下限与上限')) {
+              // SAFETY: if this wrapper contains OTHER card titles, we walked too far — bail out
+              if (containsOtherCardTitle(card, cardTitle)) {
+                return null;
+              }
               const subHeadings = Array.from(card.querySelectorAll('*')).filter(el => {
                 const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
                 return own === '额度限制';
@@ -227,6 +243,18 @@ async function main() {
 async function applyFieldUpdate(page, cardTitle, fieldIdx, newVal) {
   // Step 1: change the value in browser context
   const changed = await page.evaluate(({ cardTitle, fieldIdx, newVal }) => {
+    // SAFETY: known card titles used to detect when we walked up too far
+    const ALL_CARDS = ['储值设定', '提领设定', '总开关', 'INR → GP', 'GP → INR', 'PKR → GP', 'GP → PKR', 'CNY ↔ GP', 'CNY → GP', 'GP → CNY', 'THB ↔ GP', 'THB → GP', 'GP → THB', 'USD ↔ GP', 'USD → GP', 'GP → USD', '兑换设定'];
+
+      function containsOtherCardTitle(el, targetTitle) {
+        const desc = Array.from(el.querySelectorAll('*'));
+        for (const d of desc) {
+          const own = Array.from(d.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
+          if (own !== targetTitle && ALL_CARDS.includes(own)) return true;
+        }
+        return false;
+      }
+
     const all = Array.from(document.querySelectorAll('*'));
     const headings = all.filter(el => {
       const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
@@ -237,6 +265,10 @@ async function applyFieldUpdate(page, cardTitle, fieldIdx, newVal) {
       for (let i = 0; i < 8; i++) {
         if (!card) break;
         if (card.innerText.includes('额度限制') && card.innerText.includes('单笔交易的下限与上限')) {
+          // SAFETY: if this wrapper contains OTHER card titles, we walked too far — abort so we don't write to wrong card
+          if (containsOtherCardTitle(card, cardTitle)) {
+            return false;
+          }
           const subHeadings = Array.from(card.querySelectorAll('*')).filter(el => {
             const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
             return own === '额度限制';
@@ -384,6 +416,17 @@ async function scrollAndScreenshot(page, cardTitle, label) {
       return own === title;
     });
 
+    // SAFETY list — used to detect if screenshot target walked up too far
+    const ALL_CARDS_SHOT = ['储值设定', '提领设定', '总开关', 'INR → GP', 'GP → INR', 'PKR → GP', 'GP → PKR', 'CNY ↔ GP', 'CNY → GP', 'GP → CNY', 'THB ↔ GP', 'THB → GP', 'GP → THB', 'USD ↔ GP', 'USD → GP', 'GP → USD', '兑换设定'];
+    function containsOtherCardTitleShot(el, targetTitle) {
+      const desc = Array.from(el.querySelectorAll('*'));
+      for (const d of desc) {
+        const own = Array.from(d.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
+        if (own !== targetTitle && ALL_CARDS_SHOT.includes(own)) return true;
+      }
+      return false;
+    }
+
     for (const heading of headings) {
       let card = heading.parentElement;
       for (let i = 0; i < 10; i++) {
@@ -393,6 +436,11 @@ async function scrollAndScreenshot(page, cardTitle, label) {
         if (card.innerText.includes(title)
             && card.innerText.includes('额度限制')
             && card.innerText.includes('单笔交易的下限与上限')) {
+          // SAFETY: if this wrapper contains OTHER card titles, we walked too far — skip
+          if (containsOtherCardTitleShot(card, title)) {
+            card = card.parentElement;
+            continue;
+          }
           card.setAttribute('data-vf-shot', '1');
           // Scroll it into view so the screenshot reliably captures it
           card.scrollIntoView({ behavior: 'instant', block: 'start' });
