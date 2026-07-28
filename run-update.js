@@ -139,22 +139,16 @@ async function main() {
         for (const heading of headings) {
           let card = heading.parentElement;
           let bestCard = null;
-          // Walk up looking for the SMALLEST wrapper that contains:
-          //   1. Some 额度限制/提款额度限制 sub-heading, AND
-          //   2. Only ONE such sub-heading (so we know we're in a single card, not a multi-card wrapper)
-          // Use textContent so we don't miss collapsed/hidden text.
-          for (let i = 0; i < 10; i++) {
+          // Walk up MAX 5 levels (was 10 — cut for perf).
+          // Break early if wrapper text is too large (walked to page root).
+          for (let i = 0; i < 5; i++) {
             if (!card) break;
-            if (/额度限制/.test(card.textContent)) {
+            const text = card.textContent || '';
+            if (text.length > 8000) break; // wrapper too big — bail before expensive scan
+            if (/额度限制/.test(text)) {
               const count = countLimitSubHeadings(card);
-              if (count === 1) {
-                bestCard = card;
-                break; // smallest wrapper found
-              }
-              if (count > 1) {
-                // Walked into a wrapper that contains multiple cards → back off
-                break;
-              }
+              if (count === 1) { bestCard = card; break; }
+              if (count > 1) { break; }
             }
             card = card.parentElement;
           }
@@ -295,14 +289,15 @@ async function applyFieldUpdate(page, cardTitle, fieldIdx, newVal) {
     for (const heading of headings) {
       let card = heading.parentElement;
       let bestCard = null;
-      // Walk up looking for the SMALLEST wrapper that contains exactly ONE 额度限制 sub-heading.
-      // This means we're inside a single card — safe to write.
-      for (let i = 0; i < 10; i++) {
+      // Walk up MAX 5 levels; bail if wrapper text > 8000 chars (walked to page root)
+      for (let i = 0; i < 5; i++) {
         if (!card) break;
-        if (/额度限制/.test(card.textContent)) {
+        const text = card.textContent || '';
+        if (text.length > 8000) break;
+        if (/额度限制/.test(text)) {
           const count = countLimitSubHeadings(card);
           if (count === 1) { bestCard = card; break; }
-          if (count > 1) { break; } // walked into multi-card wrapper — abort
+          if (count > 1) { break; }
         }
         card = card.parentElement;
       }
@@ -484,9 +479,11 @@ async function scrollAndScreenshot(page, cardTitle, label) {
     for (const heading of headings) {
       let card = heading.parentElement;
       let bestCard = null;
-      for (let i = 0; i < 10; i++) {
+      for (let i = 0; i < 5; i++) {
         if (!card) break;
-        if (/额度限制/.test(card.textContent)) {
+        const text = card.textContent || '';
+        if (text.length > 8000) break;
+        if (/额度限制/.test(text)) {
           const count = countLimitSubHeadingsShot(card);
           if (count === 1) { bestCard = card; break; }
           if (count > 1) { break; }
