@@ -48,6 +48,7 @@ const CARD_MAP = {
   PKR: { deposit: '储值设定',                  withdraw: ['PKR ↔ GP', 'GP → PKR']  },
   CNY: { deposit: '储值设定',                  withdraw: ['CNY ↔ GP', 'GP → CNY']  },
   THB: { deposit: '储值设定',                  withdraw: ['THB ↔ GP', 'GP → THB']  },
+  PHP: { deposit: '储值设定',                  withdraw: ['PHP ↔ GP', 'GP → PHP']  },
   USD: { deposit: null,                       withdraw: ['USD ↔ GP', 'GP → USD']  },
 };
 
