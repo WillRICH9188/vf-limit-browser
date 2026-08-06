@@ -27,7 +27,7 @@ const CS_GROUP_ID = process.env.CS_GROUP_ID;
 
 const payload = JSON.parse(process.env.PAYLOAD || '{}');
 const {
-  uid, currency,
+  uid, currency, subChannel,   // subChannel: 'Alipay' | 'GOBAO' | null
   deposit = {}, withdraw = {}, gp_withdraw = {},
   callbackUrl, replyToMsgId,
 } = payload;
@@ -43,13 +43,24 @@ const gp_withdraw_max = gp_withdraw.max;
 // Card titles that contain the 额度限制 (or 提款额度限制) sub-block per currency.
 // Each field can be a single string OR an array of alternatives (for handling backend renames).
 // If deposit is null, the currency's deposit is fixed denominations — we skip deposit updates.
+// subTabs: if the currency has sub-channels (e.g. CNY split into Alipay/GOBAO),
+//   map the subChannel key to the sub-tab BUTTON label prefix that must be clicked
+//   AFTER selecting the currency tab. If null/absent, no sub-tab step is needed.
+//
+// For withdraw cards with a 「平台允许」 subsection (new CNY layout), the writer
+// automatically targets the GP inputs adjacent to that label (not the 商户受理 inputs).
+// Old-style cards without that subsection fall back to the first 2 inputs of the card.
 const CARD_MAP = {
-  INR: { deposit: ['INR → GP', '储值设定'],   withdraw: ['INR ↔ GP', 'GP → INR']  },
-  PKR: { deposit: '储值设定',                  withdraw: ['PKR ↔ GP', 'GP → PKR']  },
-  CNY: { deposit: '储值设定',                  withdraw: ['CNY ↔ GP', 'GP → CNY']  },
-  THB: { deposit: '储值设定',                  withdraw: ['THB ↔ GP', 'GP → THB']  },
-  PHP: { deposit: '储值设定',                  withdraw: ['PHP ↔ GP', 'GP → PHP']  },
-  USD: { deposit: null,                       withdraw: ['USD ↔ GP', 'GP → USD']  },
+  INR: { subTabs: null, deposit: ['INR → GP', '储值设定'], withdraw: ['INR ↔ GP', 'GP → INR', '提领设定'] },
+  PKR: { subTabs: null, deposit: '储值设定',                withdraw: ['PKR ↔ GP', 'GP → PKR', '提领设定'] },
+  CNY: {
+    subTabs: { Alipay: '支付宝 Alipay', GOBAO: '购宝 GOBAO' },
+    deposit: '储值设定',
+    withdraw: '提领设定',
+  },
+  THB: { subTabs: null, deposit: '储值设定',                withdraw: ['THB ↔ GP', 'GP → THB', '提领设定'] },
+  PHP: { subTabs: null, deposit: '储值设定',                withdraw: ['PHP ↔ GP', 'GP → PHP', '提领设定'] },
+  USD: { subTabs: null, deposit: null,                      withdraw: ['USD ↔ GP', 'GP → USD', '提领设定'] },
 };
 
 // Normalize a title spec (string or array) into an array
@@ -57,6 +68,9 @@ function titleList(spec) {
   if (!spec) return [];
   return Array.isArray(spec) ? spec : [spec];
 }
+
+function depositTitlesArr(cards) { return titleList(cards.deposit); }
+function withdrawTitlesArr(cards) { return titleList(cards.withdraw); }
 
 // Sub-block heading that holds the min/max inputs. Backend renamed
 // deposit's is still "额度限制", withdraw's is now "提款额度限制".
@@ -109,6 +123,24 @@ async function main() {
     if (!tabClicked) throw new Error(`Cannot find ${currency} tab button`);
     await page.waitForTimeout(2000);
 
+    // ---- Step 3b: Click sub-tab if this currency has sub-channels (e.g. CNY) ----
+    const cardsForCurrency = CARD_MAP[currency];
+    if (!cardsForCurrency) throw new Error(`No card mapping for currency ${currency}`);
+    if (cardsForCurrency.subTabs) {
+      if (!subChannel) throw new Error(`${currency} requires subChannel in payload`);
+      const subTabLabel = cardsForCurrency.subTabs[subChannel];
+      if (!subTabLabel) throw new Error(`Unknown subChannel "${subChannel}" for ${currency}`);
+      console.log(`[${uid}] Switching to sub-tab "${subTabLabel}"...`);
+      const subTabClicked = await page.evaluate((label) => {
+        const btns = Array.from(document.querySelectorAll('button'));
+        const btn = btns.find(b => b.innerText.trim().startsWith(label));
+        if (btn) { btn.click(); return true; }
+        return false;
+      }, subTabLabel);
+      if (!subTabClicked) throw new Error(`Cannot find sub-tab button "${subTabLabel}"`);
+      await page.waitForTimeout(1500);
+    }
+
     // ---- Step 4: Expand all sections ----
     console.log(`[${uid}] Expanding all sections...`);
     await page.evaluate(() => {
@@ -118,76 +150,105 @@ async function main() {
     await page.waitForTimeout(2500);
 
     // ---- Step 5: Read current values ----
-    const cards = CARD_MAP[currency];
-    if (!cards) throw new Error(`No card mapping for currency ${currency}`);
+    const cards = cardsForCurrency; // already validated above
 
     const currentValues = await page.evaluate((cardsSpec) => {
-      // Count "额度限制"-suffix sub-headings within an element
-      function countLimitSubHeadings(el) {
-        return Array.from(el.querySelectorAll('*')).filter(x => {
-          const own = Array.from(x.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
-          return /额度限制$/.test(own);
-        }).length;
+      // ============================================================
+      // Helpers (redefined inside evaluate — page context)
+      // ============================================================
+
+      // Find candidate elements whose "own text" (direct text-node children joined) === value.
+      // Prefer SPAN matches; fallback to any element with matching own text.
+      function findHeadingCandidates(text) {
+        const spans = Array.from(document.querySelectorAll('span'));
+        const spanHits = spans.filter(s => s.textContent.trim() === text);
+        if (spanHits.length) return spanHits;
+        const all = Array.from(document.querySelectorAll('*'));
+        return all.filter(el => {
+          const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
+          return own === text;
+        });
       }
 
-      function findLimitInputsForTitle(cardTitle) {
-        if (!cardTitle) return null;
-        const all = Array.from(document.querySelectorAll('*'));
-        const headings = all.filter(el => {
-          const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
-          return own === cardTitle;
-        });
-        for (const heading of headings) {
-          let card = heading.parentElement;
-          let bestCard = null;
-          // Walk up MAX 5 levels (was 10 — cut for perf).
-          // Break early if wrapper text is too large (walked to page root).
-          for (let i = 0; i < 5; i++) {
-            if (!card) break;
-            const text = card.textContent || '';
-            if (text.length > 8000) break; // wrapper too big — bail before expensive scan
-            if (/额度限制/.test(text)) {
-              const count = countLimitSubHeadings(card);
-              if (count === 1) { bestCard = card; break; }
-              if (count > 1) { break; }
+      // Walk up from a heading to find the card wrapper.
+      // Card wrapper qualifies if:
+      //   - contains "额度限制"
+      //   - starts with cardTitle text (so the heading is at the top of it)
+      //   - textContent is not too large (avoid walking to page root)
+      //   - does NOT contain any excludeTitles (to distinguish sibling cards)
+      function findCardWrapper(heading, cardTitle, excludeTitles) {
+        let card = heading.parentElement;
+        for (let i = 0; i < 10; i++) {
+          if (!card) break;
+          const text = (card.textContent || '').trim();
+          if (text.length > 8000) break;
+          if (text.startsWith(cardTitle) && /额度限制/.test(text)) {
+            // Reject if this wrapper contains another card's title (means we walked too far)
+            let hasOther = false;
+            for (const other of excludeTitles) {
+              if (other && text.includes(other)) { hasOther = true; break; }
             }
-            card = card.parentElement;
+            if (!hasOther) return card;
           }
-          if (!bestCard) continue;
-
-          // Sub-heading matches "额度限制" or "提款额度限制" (anything ending with 额度限制)
-          const subHeadings = Array.from(bestCard.querySelectorAll('*')).filter(el => {
-            const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
-            return /额度限制$/.test(own);
-          });
-          for (const sh of subHeadings) {
-            let block = sh.parentElement;
-            for (let j = 0; j < 8; j++) {
-              if (!block) break;
-              const inps = block.querySelectorAll('input[type="number"]');
-              if (inps.length >= 2) {
-                return { minVal: inps[0].value, maxVal: inps[1].value, matchedTitle: cardTitle };
-              }
-              block = block.parentElement;
-            }
-          }
+          card = card.parentElement;
         }
         return null;
       }
 
-      // Try each candidate title until one works
-      function findLimitInputs(titleSpec) {
+      // Locate the 2 target inputs inside a card.
+      // For withdraw cards with a "平台允许" sub-block, we want the GP inputs
+      // adjacent to that label (NOT the 商户受理 ¥ inputs).
+      // For everything else (deposit, old-style withdraw), use the first 2 inputs.
+      function findTargetInputs(card, kind) {
+        if (kind === 'withdraw') {
+          // Try: find "平台允许" span; walk up to smallest block with >=2 inputs
+          //      that does NOT contain 商户受理 text (to skip merchant block)
+          const spans = Array.from(card.querySelectorAll('span'));
+          const platformSpan = spans.find(s => s.textContent.trim() === '平台允许');
+          if (platformSpan) {
+            let p = platformSpan.parentElement;
+            for (let i = 0; i < 6; i++) {
+              if (!p) break;
+              const containsMerchant = /商户受理/.test(p.textContent || '');
+              const inps = p.querySelectorAll('input[type="number"]');
+              if (inps.length >= 2 && !containsMerchant) {
+                return [inps[0], inps[1]];
+              }
+              p = p.parentElement;
+            }
+          }
+        }
+        // Fallback (deposit, or old-style withdraw): first 2 inputs in the card
+        const allInputs = card.querySelectorAll('input[type="number"]');
+        if (allInputs.length >= 2) return [allInputs[0], allInputs[1]];
+        return null;
+      }
+
+      // Try each candidate title from titleSpec; return the first one that resolves inputs.
+      function findLimitInputs(titleSpec, kind, excludeTitles) {
         const titles = Array.isArray(titleSpec) ? titleSpec : (titleSpec ? [titleSpec] : []);
         for (const t of titles) {
-          const found = findLimitInputsForTitle(t);
-          if (found) return found;
+          const candidates = findHeadingCandidates(t);
+          for (const heading of candidates) {
+            const card = findCardWrapper(heading, t, excludeTitles);
+            if (!card) continue;
+            const inputs = findTargetInputs(card, kind);
+            if (inputs) {
+              return { minVal: inputs[0].value, maxVal: inputs[1].value, matchedTitle: t };
+            }
+          }
         }
         return null;
       }
 
+      // When looking for deposit card, exclude any withdraw-card titles from the wrapper
+      // (and vice versa) — so we don't accidentally walk up to a wrapper containing both.
+      const depositTitles = Array.isArray(cardsSpec.deposit) ? cardsSpec.deposit : (cardsSpec.deposit ? [cardsSpec.deposit] : []);
+      const withdrawTitles = Array.isArray(cardsSpec.withdraw) ? cardsSpec.withdraw : (cardsSpec.withdraw ? [cardsSpec.withdraw] : []);
+
       return {
-        deposit: findLimitInputs(cardsSpec.deposit),
-        withdraw: findLimitInputs(cardsSpec.withdraw),
+        deposit: findLimitInputs(cardsSpec.deposit, 'deposit', withdrawTitles),
+        withdraw: findLimitInputs(cardsSpec.withdraw, 'withdraw', depositTitles),
       };
     }, cards);
 
@@ -211,10 +272,10 @@ async function main() {
       const depMinOld = Number(currentValues.deposit.minVal);
       const depMaxOld = Number(currentValues.deposit.maxVal);
       if (depMaxOld !== deposit_max) {
-        fieldUpdates.push({ cardTitle: depositCardTitle, fieldIdx: 1, kind: 'depositMax', oldVal: currentValues.deposit.maxVal, newVal: deposit_max });
+        fieldUpdates.push({ cardTitle: depositCardTitle, cardKind: 'deposit', excludeTitles: withdrawTitlesArr(cards), fieldIdx: 1, kind: 'depositMax', oldVal: currentValues.deposit.maxVal, newVal: deposit_max });
       }
       if (depMinOld !== deposit_min) {
-        fieldUpdates.push({ cardTitle: depositCardTitle, fieldIdx: 0, kind: 'depositMin', oldVal: currentValues.deposit.minVal, newVal: deposit_min });
+        fieldUpdates.push({ cardTitle: depositCardTitle, cardKind: 'deposit', excludeTitles: withdrawTitlesArr(cards), fieldIdx: 0, kind: 'depositMin', oldVal: currentValues.deposit.minVal, newVal: deposit_min });
       }
     }
 
@@ -222,16 +283,17 @@ async function main() {
       const wdMinOld = Number(currentValues.withdraw.minVal);
       const wdMaxOld = Number(currentValues.withdraw.maxVal);
       if (wdMaxOld !== gp_withdraw_max) {
-        fieldUpdates.push({ cardTitle: withdrawCardTitle, fieldIdx: 1, kind: 'withdrawMax', oldVal: currentValues.withdraw.maxVal, newVal: gp_withdraw_max });
+        fieldUpdates.push({ cardTitle: withdrawCardTitle, cardKind: 'withdraw', excludeTitles: depositTitlesArr(cards), fieldIdx: 1, kind: 'withdrawMax', oldVal: currentValues.withdraw.maxVal, newVal: gp_withdraw_max });
       }
       if (wdMinOld !== gp_withdraw_min) {
-        fieldUpdates.push({ cardTitle: withdrawCardTitle, fieldIdx: 0, kind: 'withdrawMin', oldVal: currentValues.withdraw.minVal, newVal: gp_withdraw_min });
+        fieldUpdates.push({ cardTitle: withdrawCardTitle, cardKind: 'withdraw', excludeTitles: depositTitlesArr(cards), fieldIdx: 0, kind: 'withdrawMin', oldVal: currentValues.withdraw.minVal, newVal: gp_withdraw_min });
       }
     }
 
     if (fieldUpdates.length === 0) {
       console.log(`[${uid}] No changes needed`);
-      const caption = `✅ ${currency} — No changes needed, values are already correct.\n⏱ ${taipeiNow()}`;
+      const label = subChannel ? `${currency} (${subChannel})` : currency;
+      const caption = `✅ ${label} — No changes needed, values are already correct.\n⏱ ${taipeiNow()}`;
       await sendCardScreenshots(page, cards, caption);
       return;
     }
@@ -239,7 +301,7 @@ async function main() {
     // ---- Step 7: Apply each field update one at a time ----
     for (const u of fieldUpdates) {
       console.log(`[${uid}] Updating ${u.kind} (${u.cardTitle}): ${u.oldVal} → ${u.newVal}`);
-      const ok = await applyFieldUpdate(page, u.cardTitle, u.fieldIdx, u.newVal);
+      const ok = await applyFieldUpdate(page, u.cardTitle, u.cardKind, u.excludeTitles, u.fieldIdx, u.newVal);
       if (!ok) throw new Error(`Failed to save ${u.kind} in card "${u.cardTitle}"`);
       changes.push({
         field: `${currency} ${labelOf(u.kind)}`,
@@ -260,7 +322,8 @@ async function main() {
     console.error(`[${uid}] Error:`, err);
     try {
       const errShot = await page.screenshot({ fullPage: false });
-      await sendSinglePhoto(errShot, `❌ ${currency} Update Failed\n\nError: ${err.message}`);
+      const label = subChannel ? `${currency} (${subChannel})` : currency;
+      await sendSinglePhoto(errShot, `❌ ${label} Update Failed\n\nError: ${err.message}`);
     } catch (e) {
       await reportCompletion({ uid, success: false, message: err.message, replyToMsgId });
     }
@@ -271,40 +334,60 @@ async function main() {
 }
 
 // ---- Apply a single field update (change value + click 储存 + confirm dialog) ----
-async function applyFieldUpdate(page, cardTitle, fieldIdx, newVal) {
+async function applyFieldUpdate(page, cardTitle, cardKind, excludeTitles, fieldIdx, newVal) {
   // Step 1: change the value in browser context
-  const changed = await page.evaluate(({ cardTitle, fieldIdx, newVal }) => {
-    // Count "额度限制"-suffix sub-headings within an element
-    function countLimitSubHeadings(el) {
-      return Array.from(el.querySelectorAll('*')).filter(x => {
-        const own = Array.from(x.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
-        return /额度限制$/.test(own);
-      }).length;
+  const changed = await page.evaluate(({ cardTitle, cardKind, excludeTitles, fieldIdx, newVal }) => {
+    // ---- Helpers (page context) ----
+    function findHeadingCandidates(text) {
+      const spans = Array.from(document.querySelectorAll('span'));
+      const spanHits = spans.filter(s => s.textContent.trim() === text);
+      if (spanHits.length) return spanHits;
+      const all = Array.from(document.querySelectorAll('*'));
+      return all.filter(el => {
+        const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
+        return own === text;
+      });
     }
 
-    const all = Array.from(document.querySelectorAll('*'));
-    const headings = all.filter(el => {
-      const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
-      return own === cardTitle;
-    });
-    for (const heading of headings) {
+    function findCardWrapper(heading, cardTitle, excludeTitles) {
       let card = heading.parentElement;
-      let bestCard = null;
-      // Walk up MAX 5 levels; bail if wrapper text > 8000 chars (walked to page root)
-      for (let i = 0; i < 5; i++) {
+      for (let i = 0; i < 10; i++) {
         if (!card) break;
-        const text = card.textContent || '';
+        const text = (card.textContent || '').trim();
         if (text.length > 8000) break;
-        if (/额度限制/.test(text)) {
-          const count = countLimitSubHeadings(card);
-          if (count === 1) { bestCard = card; break; }
-          if (count > 1) { break; }
+        if (text.startsWith(cardTitle) && /额度限制/.test(text)) {
+          let hasOther = false;
+          for (const other of excludeTitles) {
+            if (other && text.includes(other)) { hasOther = true; break; }
+          }
+          if (!hasOther) return card;
         }
         card = card.parentElement;
       }
-      if (!bestCard) continue;
+      return null;
+    }
 
-      const subHeadings = Array.from(bestCard.querySelectorAll('*')).filter(el => {
+    // Locate the target input BLOCK (not just the input) — we need the block for the 储存 button
+    // Returns { block, targetInput }
+    function findTargetBlock(card, kind, fieldIdx) {
+      if (kind === 'withdraw') {
+        const spans = Array.from(card.querySelectorAll('span'));
+        const platformSpan = spans.find(s => s.textContent.trim() === '平台允许');
+        if (platformSpan) {
+          let p = platformSpan.parentElement;
+          for (let i = 0; i < 6; i++) {
+            if (!p) break;
+            const containsMerchant = /商户受理/.test(p.textContent || '');
+            const inps = p.querySelectorAll('input[type="number"]');
+            if (inps.length >= 2 && !containsMerchant) {
+              return { block: p, targetInput: inps[fieldIdx] };
+            }
+            p = p.parentElement;
+          }
+        }
+      }
+      // Fallback: 额度限制 sub-heading → walk up to smallest 2-input block
+      const subHeadings = Array.from(card.querySelectorAll('*')).filter(el => {
         const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
         return /额度限制$/.test(own);
       });
@@ -314,22 +397,33 @@ async function applyFieldUpdate(page, cardTitle, fieldIdx, newVal) {
           if (!block) break;
           const inps = block.querySelectorAll('input[type="number"]');
           if (inps.length >= 2) {
-            const target = inps[fieldIdx];
-            const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-            nativeSetter.call(target, String(newVal));
-            target.dispatchEvent(new Event('input', { bubbles: true }));
-            target.dispatchEvent(new Event('change', { bubbles: true }));
-            target.dispatchEvent(new Event('blur', { bubbles: true }));
-            // Mark this block so we can find the 储存 button later
-            block.setAttribute('data-vf-active', '1');
-            return true;
+            return { block, targetInput: inps[fieldIdx] };
           }
           block = block.parentElement;
         }
       }
+      return null;
+    }
+
+    // ---- Main ----
+    const candidates = findHeadingCandidates(cardTitle);
+    for (const heading of candidates) {
+      const card = findCardWrapper(heading, cardTitle, excludeTitles);
+      if (!card) continue;
+      const found = findTargetBlock(card, cardKind, fieldIdx);
+      if (!found) continue;
+      const { block, targetInput } = found;
+      const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+      nativeSetter.call(targetInput, String(newVal));
+      targetInput.dispatchEvent(new Event('input', { bubbles: true }));
+      targetInput.dispatchEvent(new Event('change', { bubbles: true }));
+      targetInput.dispatchEvent(new Event('blur', { bubbles: true }));
+      // Mark this block so we can find the 储存 button later
+      block.setAttribute('data-vf-active', '1');
+      return true;
     }
     return false;
-  }, { cardTitle, fieldIdx, newVal });
+  }, { cardTitle, cardKind, excludeTitles, fieldIdx, newVal });
 
   if (!changed) return false;
   await page.waitForTimeout(800); // wait for 储存 button to appear
@@ -386,8 +480,9 @@ function buildCaption(cur, changes, currentValues) {
   const depMax = changes.find(c => c.field.includes('Deposit Max'));
   const wdMin = changes.find(c => c.field.includes('Withdraw GP Min'));
   const wdMax = changes.find(c => c.field.includes('Withdraw GP Max'));
+  const label = subChannel ? `${cur} (${subChannel})` : cur;
 
-  let t = `✅ ${cur} Limit Update Completed\n━━━━━━━━━━━━━━━━━━\n\n`;
+  let t = `✅ ${label} Limit Update Completed\n━━━━━━━━━━━━━━━━━━\n\n`;
 
   // Deposit (skipped for USD — fixed denominations)
   if (currentValues.deposit) {
@@ -415,24 +510,25 @@ function buildCaption(cur, changes, currentValues) {
 // ---- Send card screenshots (one or two cards depending on whether deposit is skipped) ----
 // Handles array titles: tries each candidate until one works.
 async function sendCardScreenshots(page, cards, caption) {
-  const withdrawShot = await scrollAndScreenshotAny(page, cards.withdraw, `${currency} Withdraw`);
+  const depositExcludes = titleList(cards.deposit);
+  const withdrawExcludes = titleList(cards.withdraw);
+  const withdrawShot = await scrollAndScreenshotAny(page, cards.withdraw, depositExcludes, `${currency} Withdraw`);
   if (cards.deposit) {
-    // Two cards → media group (album)
-    const depositShot = await scrollAndScreenshotAny(page, cards.deposit, `${currency} Deposit`);
+    const depositShot = await scrollAndScreenshotAny(page, cards.deposit, withdrawExcludes, `${currency} Deposit`);
     await sendMediaGroup(depositShot, withdrawShot, caption);
   } else {
-    // USD: only withdraw card → single photo
     await sendSinglePhoto(withdrawShot, caption);
   }
 }
 
 // Try each candidate title until we get a real element screenshot (not fallback viewport)
-async function scrollAndScreenshotAny(page, titleSpec, label) {
+async function scrollAndScreenshotAny(page, titleSpec, excludeTitles, label) {
   const titles = Array.isArray(titleSpec) ? titleSpec : (titleSpec ? [titleSpec] : [null]);
   for (const t of titles) {
-    // Check if this title can be found first
     const found = await page.evaluate((title) => {
       if (!title) return false;
+      const spans = Array.from(document.querySelectorAll('span'));
+      if (spans.some(s => s.textContent.trim() === title)) return true;
       const all = Array.from(document.querySelectorAll('*'));
       return all.some(el => {
         const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
@@ -440,7 +536,7 @@ async function scrollAndScreenshotAny(page, titleSpec, label) {
       });
     }, t);
     if (found || t === titles[titles.length - 1]) {
-      return await scrollAndScreenshot(page, t, label);
+      return await scrollAndScreenshot(page, t, excludeTitles, label);
     }
   }
   return await page.screenshot({ fullPage: false });
@@ -454,40 +550,40 @@ function taipeiNow() {
 // ---- Take an element-bounded screenshot of the specified card ----
 // Finds the smallest container that holds the card title AND its 额度限制 block,
 // scrolls it into view, then captures using its bounding box.
-async function scrollAndScreenshot(page, cardTitle, label) {
+// excludeTitles: the OTHER card's title candidates (deposit vs withdraw) so we
+// don't accidentally mark a wrapper containing both cards.
+async function scrollAndScreenshot(page, cardTitle, excludeTitles, label) {
   console.log(`[${uid}] Screenshot: ${label} (card="${cardTitle}")`);
   if (!cardTitle) return await page.screenshot({ fullPage: false });
 
   // 1) Mark the target card with a data attribute so we can locate it from Playwright
-  const marked = await page.evaluate((title) => {
+  const marked = await page.evaluate(({ title, excludeTitles }) => {
     // Clear any prior mark
     document.querySelectorAll('[data-vf-shot]').forEach(el => el.removeAttribute('data-vf-shot'));
 
-    const all = Array.from(document.querySelectorAll('*'));
-    const headings = all.filter(el => {
-      const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
-      return own === title;
-    });
-
-    // Count "额度限制"-suffix sub-headings within an element
-    function countLimitSubHeadingsShot(el) {
-      return Array.from(el.querySelectorAll('*')).filter(x => {
-        const own = Array.from(x.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
-        return /额度限制$/.test(own);
-      }).length;
+    // Prefer SPAN with exact textContent; fall back to own-text-node match
+    let headings = Array.from(document.querySelectorAll('span')).filter(s => s.textContent.trim() === title);
+    if (!headings.length) {
+      const all = Array.from(document.querySelectorAll('*'));
+      headings = all.filter(el => {
+        const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
+        return own === title;
+      });
     }
 
     for (const heading of headings) {
       let card = heading.parentElement;
       let bestCard = null;
-      for (let i = 0; i < 5; i++) {
+      for (let i = 0; i < 10; i++) {
         if (!card) break;
-        const text = card.textContent || '';
+        const text = (card.textContent || '').trim();
         if (text.length > 8000) break;
-        if (/额度限制/.test(text)) {
-          const count = countLimitSubHeadingsShot(card);
-          if (count === 1) { bestCard = card; break; }
-          if (count > 1) { break; }
+        if (text.startsWith(title) && /额度限制/.test(text)) {
+          let hasOther = false;
+          for (const other of excludeTitles) {
+            if (other && text.includes(other)) { hasOther = true; break; }
+          }
+          if (!hasOther) { bestCard = card; break; }
         }
         card = card.parentElement;
       }
@@ -498,7 +594,7 @@ async function scrollAndScreenshot(page, cardTitle, label) {
       }
     }
     return false;
-  }, cardTitle);
+  }, { title: cardTitle, excludeTitles });
 
   if (!marked) {
     console.log(`[${uid}] Could not locate card "${cardTitle}", falling back to viewport screenshot`);
