@@ -60,6 +60,8 @@ const CARD_MAP = {
   },
   THB: { subTabs: null, deposit: '储值设定',                withdraw: ['THB ↔ GP', 'GP → THB', '提领设定'] },
   PHP: { subTabs: null, deposit: '储值设定',                withdraw: ['PHP ↔ GP', 'GP → PHP', '提领设定'] },
+  // VND: withdraw 卡片是舊式 「VND ↔ GP」,提领设定卡片是廠商能力(不動),故不加 '提领设定' 到 alternatives
+  VND: { subTabs: null, deposit: '储值设定',                withdraw: ['VND ↔ GP', 'GP → VND'] },
   USD: { subTabs: null, deposit: null,                      withdraw: ['USD ↔ GP', 'GP → USD', '提领设定'] },
 };
 
