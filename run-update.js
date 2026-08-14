@@ -34,6 +34,7 @@ const {
 
 const deposit_min = deposit.min;
 const deposit_max = deposit.max;
+const deposit_unavailable = deposit.unavailable || false;
 const withdraw_min = withdraw.min;
 const withdraw_max = withdraw.max;
 const withdraw_unavailable = withdraw.unavailable || false;
@@ -269,8 +270,10 @@ async function main() {
     // So we save MAX first, then MIN, for each card.
     const fieldUpdates = [];
 
-    // Deposit updates — skipped entirely if this currency has fixed denominations (USD)
-    if (cards.deposit && currentValues.deposit && deposit_min !== null && deposit_max !== null) {
+    // Deposit updates — skipped if:
+    //   - currency has fixed denominations (USD, cards.deposit = null)
+    //   - deposit is under maintenance (deposit_unavailable = true)
+    if (cards.deposit && !deposit_unavailable && currentValues.deposit && deposit_min !== null && deposit_max !== null) {
       const depMinOld = Number(currentValues.deposit.minVal);
       const depMaxOld = Number(currentValues.deposit.maxVal);
       if (depMaxOld !== deposit_max) {
@@ -486,8 +489,11 @@ function buildCaption(cur, changes, currentValues) {
 
   let t = `✅ ${label} Limit Update Completed\n━━━━━━━━━━━━━━━━━━\n\n`;
 
-  // Deposit (skipped for USD — fixed denominations)
-  if (currentValues.deposit) {
+  // Deposit
+  if (deposit_unavailable) {
+    t += `💰 Deposit Settings\n`;
+    t += `   ⛔ Under Maintenance (not changed)\n\n`;
+  } else if (currentValues.deposit) {
     t += `💰 Deposit Settings\n`;
     t += `   Min: ${depMin ? depMin.oldVal + ' → ' + depMin.newVal + ' ✅' : (currentValues.deposit?.minVal || '—') + ' (no change)'}\n`;
     t += `   Max: ${depMax ? depMax.oldVal + ' → ' + depMax.newVal + ' ✅' : (currentValues.deposit?.maxVal || '—') + ' (no change)'}\n\n`;
@@ -497,7 +503,7 @@ function buildCaption(cur, changes, currentValues) {
 
   if (withdraw_unavailable) {
     t += `💸 Withdraw Settings\n`;
-    t += `   ⛔ Suspended (Insufficient merchant balance)\n\n`;
+    t += `   ⛔ Under Maintenance (not changed)\n\n`;
   } else {
     t += `💸 Withdraw Settings\n`;
     t += `   Range: ${(withdraw_min || 0).toLocaleString()} – ${(withdraw_max || 0).toLocaleString()} ${cur}\n`;
