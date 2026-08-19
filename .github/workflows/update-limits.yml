@@ -7,19 +7,20 @@ on:
 jobs:
   update:
     runs-on: ubuntu-latest
+    # Use the official Playwright Docker image which ships with:
+    #   - Ubuntu 24.04 (noble)
+    #   - Node.js 20
+    #   - Chromium browser + all required system libraries pre-installed at /ms-playwright
+    # This avoids the flaky "apt-get install --with-deps" step that occasionally
+    # timed out for 10+ minutes when Azure's Ubuntu apt mirrors were slow.
+    container:
+      image: mcr.microsoft.com/playwright:v1.47.0-noble
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
       - name: Install dependencies
         run: npm install
-
-      - name: Install Playwright browsers
-        run: npx playwright install chromium --with-deps
 
       - name: Run update script
         env:
@@ -28,4 +29,6 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CS_GROUP_ID: ${{ secrets.CS_GROUP_ID }}
           PAYLOAD: ${{ toJson(github.event.client_payload) }}
+          # Tell Playwright to use the browser binaries baked into the container
+          PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
         run: node run-update.js
