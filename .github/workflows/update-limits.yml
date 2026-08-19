@@ -14,7 +14,7 @@ jobs:
     # This avoids the flaky "apt-get install --with-deps" step that occasionally
     # timed out for 10+ minutes when Azure's Ubuntu apt mirrors were slow.
     container:
-      image: mcr.microsoft.com/playwright:v1.47.0-noble
+      image: mcr.microsoft.com/playwright:v1.62.1-jammy
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
